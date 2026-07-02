@@ -368,6 +368,7 @@ class SNIESMatriculasScraper:
         self.raw_dir = raw_dir or RAW_HISTORIC_DIR
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.manual_dir = REF_DIR / "backup" / "matriculas"
+        self._consolidado_pc_cache: dict[tuple[int, int], pd.DataFrame] | None = None
 
     @staticmethod
     def _norm_col_name(name: str) -> str:
@@ -683,48 +684,141 @@ class SNIESMatriculasScraper:
             log_warning(f"[Fase 2] Inscritos {year}: no se pudo guardar CSV: {e}.")
         return out[["CÓDIGO_SNIES_DEL_PROGRAMA", "INSCRITOS", "INSCRITOS_S1", "INSCRITOS_S2"]].copy()
 
+    def _cargar_consolidado_pc(self) -> dict[tuple[int, int], pd.DataFrame]:
+        """
+        Lee matriculas_primercurso_ESTANDARIZADO.xlsx en una sola pasada y construye
+        un diccionario {(year, semestre): DataFrame} para acceso rápido en download_primer_curso.
+
+        Usa _indices_columnas_consolidado de mercado_pipeline para detectar columnas.
+        Retorna dict vacío si el archivo no existe o falla.
+        """
+        from etl.mercado_pipeline import (
+            _hoja_primer_curso_snies,
+            _indices_columnas_consolidado,
+            _normalizar_snies_valor,
+            ruta_consolidado_primer_curso,
+        )
+
+        ruta = ruta_consolidado_primer_curso(REF_DIR)
+        if not ruta.exists():
+            log_warning(
+                f"[Fase 2] No se encontró {ruta.name} en ref/backup/matriculas primer curso/."
+            )
+            return {}
+
+        try:
+            import openpyxl
+
+            acum: dict[tuple[int, int], dict[str, float]] = {}
+            wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+            try:
+                ws = wb[_hoja_primer_curso_snies(wb)]
+                row_iter = ws.iter_rows(min_row=1, values_only=True)
+                header = next(row_iter, None)
+                if not header:
+                    raise ValueError("archivo consolidado sin encabezado")
+
+                cols = _indices_columnas_consolidado(header)
+                idx_snies = cols["snies"]
+                idx_ano = cols["ano"]
+                idx_sem = cols["semestre"]
+                idx_pc = cols["pc"]
+                if any(x is None for x in (idx_snies, idx_ano, idx_sem, idx_pc)):
+                    log_warning(
+                        f"[Fase 2] {ruta.name}: columnas requeridas no encontradas "
+                        "(codigo_snies_del_programa, AÑO, SEMESTRE, PRIMER CURSO)."
+                    )
+                    return {}
+
+                max_idx = max(idx_snies, idx_ano, idx_sem, idx_pc)
+                for row in row_iter:
+                    if not row or len(row) <= max_idx:
+                        continue
+                    try:
+                        ano = int(row[idx_ano])
+                        sem = int(row[idx_sem])
+                    except (TypeError, ValueError):
+                        continue
+                    if sem not in (1, 2):
+                        continue
+                    snies = _normalizar_snies_valor(row[idx_snies])
+                    if snies is None:
+                        continue
+                    try:
+                        pc = float(row[idx_pc]) if row[idx_pc] is not None else 0.0
+                    except (TypeError, ValueError):
+                        pc = 0.0
+                    key = (ano, sem)
+                    if key not in acum:
+                        acum[key] = {}
+                    acum[key][snies] = acum[key].get(snies, 0.0) + pc
+            finally:
+                wb.close()
+
+            result: dict[tuple[int, int], pd.DataFrame] = {}
+            for key, datos in acum.items():
+                result[key] = pd.DataFrame(
+                    {
+                        "CÓDIGO_SNIES_DEL_PROGRAMA": list(datos.keys()),
+                        "PRIMER_CURSO": list(datos.values()),
+                    }
+                )
+            log_info(
+                f"[Fase 2] Consolidado primer curso cargado: {len(result)} pares año-semestre."
+            )
+            return result
+        except Exception as exc:
+            log_warning(f"[Fase 2] Error leyendo consolidado primer curso: {exc}")
+            return {}
+
     def download_primer_curso(self, year: int, semestre: int) -> pd.DataFrame:
         """
-        Lee primer curso desde ref/backup/primer_curso/primer_curso_{year}.xlsx.
+        Lee primer curso desde matriculas_primercurso_ESTANDARIZADO.xlsx (consolidado).
         Si no existe o falla, retorna DataFrame vacío (no bloquea el pipeline).
         """
         archivo = self.raw_dir / f"primer_curso_{year}_{semestre}.csv"
         cached = self._load_cached(archivo, {"CÓDIGO_SNIES_DEL_PROGRAMA", "PRIMER_CURSO"})
         if cached is not None:
             try:
-                src = REF_DIR / "backup" / "matriculas primer curso" / f"primer_curso_{year}.xlsx"
-                if src.exists() and src.stat().st_mtime > archivo.stat().st_mtime:
+                from etl.mercado_pipeline import ruta_consolidado_primer_curso
+
+                ruta_cons = ruta_consolidado_primer_curso(REF_DIR)
+                if ruta_cons.exists() and ruta_cons.stat().st_mtime > archivo.stat().st_mtime:
                     log_info(
-                        f"[Fase 2] Excel {src.name} fue modificado después del CSV en caché. "
-                        f"Reconstruyendo primer curso para {year}-S{semestre}..."
+                        f"[Fase 2] Consolidado más reciente que CSV. "
+                        f"Reconstruyendo {year}-S{semestre}..."
                     )
                     cached = None
             except Exception:
                 pass
             if cached is not None:
-                log_info(f"[Fase 2] Primer curso {year}-{semestre}: cargado desde disco ({len(cached):,} filas)")
+                log_info(
+                    f"[Fase 2] Primer curso {year}-{semestre}: cargado desde disco "
+                    f"({len(cached):,} filas)"
+                )
                 return cached
 
-        src = REF_DIR / "backup" / "matriculas primer curso" / f"primer_curso_{year}.xlsx"
-        if not src.exists():
+        if self._consolidado_pc_cache is None:
+            self._consolidado_pc_cache = self._cargar_consolidado_pc()
+
+        df = self._consolidado_pc_cache.get((int(year), int(semestre)))
+        if df is None or len(df) == 0:
             log_warning(
-                f"[Fase 2] Primer curso {year}: no existe {src}. "
-                "Coloque el Excel en ref/backup/primer_curso/."
+                f"[Fase 2] Primer curso {year}-S{semestre}: no hay datos en el consolidado."
             )
             return _empty_primer_curso()
 
-        df_pc = _leer_primer_curso_snies(src, year=year, semestre=int(semestre))
-        if df_pc is None or len(df_pc) == 0:
-            return _empty_primer_curso()
-
-        out = df_pc.rename(columns={"CÓDIGO SNIES DEL PROGRAMA": "CÓDIGO_SNIES_DEL_PROGRAMA"}).copy()
+        out = df.copy()
         out["SEMESTRE"] = int(semestre)
         out_path = self.raw_dir / f"primer_curso_{year}_{semestre}.csv"
         try:
             out[["CÓDIGO_SNIES_DEL_PROGRAMA", "PRIMER_CURSO", "SEMESTRE"]].to_csv(
                 out_path, index=False, encoding="utf-8-sig"
             )
-            log_info(f"[Fase 2] Primer curso {year}-{semestre}: guardado {out_path.name} ({len(out):,} filas)")
+            log_info(
+                f"[Fase 2] Primer curso {year}-{semestre}: guardado {out_path.name} "
+                f"({len(out):,} filas)"
+            )
         except Exception as e:
             log_warning(f"[Fase 2] Primer curso {year}-{semestre}: no se pudo guardar CSV: {e}.")
         return out[["CÓDIGO_SNIES_DEL_PROGRAMA", "PRIMER_CURSO", "SEMESTRE"]].copy()

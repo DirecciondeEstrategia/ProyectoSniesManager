@@ -17,7 +17,7 @@ import time
 import tkinter as tk
 import pandas as pd
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # Dependencia ya usada por el resto del proyecto (ETL)
 # pandas se importa lazy donde se necesita (no al inicio para acelerar arranque)
@@ -3124,7 +3124,7 @@ class ConfiguracionDialog(tk.Toplevel):
     _ARCHIVOS_REQUERIDOS: dict[str, str] = {
         "Matrícula": "matriculados_{año}.xlsx",
         "Inscritos": "inscritos_{año}.xlsx",
-        "Primer curso": "primer_curso_{año}.xlsx",
+        "Primer curso": "matriculas_primercurso_ESTANDARIZADO.xlsx",
         "Graduados": "graduados_{año}.xlsx",
     }
 
@@ -3248,6 +3248,13 @@ class ConfiguracionDialog(tk.Toplevel):
 
             self._file_labels[tipo] = (lbl_nombre, lbl_estado)
 
+            if tipo == "Primer curso":
+                ttk.Button(
+                    grid,
+                    text="📥 Agregar año nuevo al consolidado",
+                    command=self._on_actualizar_primer_curso,
+                ).grid(row=row, column=col + 3, sticky="w", padx=(4, 0), pady=3)
+
         self._lbl_resumen = ttk.Label(sec2, text="", style="Muted.TLabel", font=("Segoe UI", 9, "italic"))
         self._lbl_resumen.pack(anchor="w", pady=(8, 0))
 
@@ -3318,6 +3325,24 @@ class ConfiguracionDialog(tk.Toplevel):
         total = len(self._ARCHIVOS_REQUERIDOS)
 
         for tipo, patron in self._ARCHIVOS_REQUERIDOS.items():
+            if tipo == "Primer curso":
+                from etl.mercado_pipeline import (
+                    consolidado_primer_curso_contiene_año,
+                    ruta_consolidado_primer_curso,
+                )
+
+                ruta_pc = ruta_consolidado_primer_curso()
+                existe = ruta_pc.exists() and consolidado_primer_curso_contiene_año(año, ruta_pc)
+                lbl_nombre, lbl_estado = self._file_labels[tipo]
+                lbl_nombre.configure(text=patron)
+                lbl_estado.configure(
+                    text="✅" if existe else "❌",
+                    foreground=EAFIT["success"] if existe else EAFIT["danger"],
+                )
+                if existe:
+                    presentes += 1
+                continue
+
             nombre = patron.format(año=año)
             candidatos = [
                 backup / nombre,
@@ -3351,6 +3376,65 @@ class ConfiguracionDialog(tk.Toplevel):
             color = EAFIT["warning"]
 
         self._lbl_resumen.configure(text=resumen, foreground=color)
+
+    def _on_actualizar_primer_curso(self) -> None:
+        try:
+            from etl.config import AÑO_FIN_DATOS as _afd
+
+            _max_año = int(_afd) + 2
+        except Exception:
+            _max_año = 2026
+
+        año = simpledialog.askinteger(
+            "Año a agregar",
+            f"¿Qué año del archivo SNIES desea incorporar al consolidado?\n(2014 – {_max_año})",
+            parent=self,
+            minvalue=2014,
+            maxvalue=_max_año,
+        )
+        if año is None:
+            return
+
+        ruta = filedialog.askopenfilename(
+            parent=self,
+            title=f"Seleccionar archivo crudo de primer curso ({año})",
+            filetypes=[("Excel", "*.xlsx"), ("Todos", "*.*")],
+        )
+        if not ruta:
+            return
+
+        try:
+            from etl.mercado_pipeline import actualizar_consolidado_primer_curso
+
+            resumen = actualizar_consolidado_primer_curso(Path(ruta), año)
+        except Exception as exc:
+            messagebox.showerror(
+                "Error al actualizar consolidado",
+                f"No se pudo fusionar el archivo en matriculas_primercurso_ESTANDARIZADO.xlsx:\n\n{exc}",
+                parent=self,
+            )
+            return
+
+        accion = "reemplazado" if resumen.get("año_reemplazado") else "agregado"
+        cols_sin = resumen.get("columnas_sin_mapeo") or []
+        extra_cols = ""
+        if cols_sin:
+            extra_cols = (
+                f"\n\n⚠ Columnas sin mapeo ({len(cols_sin)}): "
+                f"{', '.join(cols_sin[:8])}"
+                + ("..." if len(cols_sin) > 8 else "")
+            )
+
+        messagebox.showinfo(
+            "Consolidado actualizado",
+            f"Año {resumen['año']} {accion} correctamente.\n\n"
+            f"Programas únicos: {resumen['programas']:,}\n"
+            f"Filas escritas: {resumen['filas_nuevas']:,}\n"
+            f"Total estudiantes (S1+S2): {resumen['total_estudiantes']:,.0f}"
+            f"{extra_cols}",
+            parent=self,
+        )
+        self._refresh_archivos()
 
     def _guardar(self) -> None:
         try:
@@ -5572,7 +5656,7 @@ class PipelinePage(ttk.Frame):
 # Diagnóstico visual en MercadoPipelinePage (ref/backup + insumos clave)
 _MERCADO_BACKUP_CHECKS: list[tuple[str, str | None, str]] = [
     ("Matrículas 2019-2024", "backup/matriculas", "6 archivos matriculados_{año}.xlsx"),
-    ("Primer Curso 2019-2024", "backup/matriculas primer curso", "6 archivos primer_curso_{año}.xlsx"),
+    ("Primer Curso 2014-2024", "backup/matriculas primer curso", "matriculas_primercurso_ESTANDARIZADO.xlsx"),
     ("Graduados 2019-2024", "backup/graduados", "6 archivos graduados_{año}.xlsx"),
     ("Inscritos SNIES", "backup/inscritos", "Archivos inscritos_{año}.xlsx"),
     ("OLE Indicadores", "backup", "ole_indicadores.csv o .xlsx"),
@@ -5582,7 +5666,12 @@ _MERCADO_BACKUP_CHECKS: list[tuple[str, str | None, str]] = [
 ]
 
 
-def _check_backup_source(ref_dir: Path, ruta_rel: str | None, etiqueta: str) -> tuple[str, str]:
+def _check_backup_source(
+    ref_dir: Path,
+    ruta_rel: str | None,
+    etiqueta: str,
+    verificacion_completa: bool = False,
+) -> tuple[str, str]:
     """
     Valida disponibilidad de insumos del estudio de mercado (ref/backup/, ref/, outputs/).
     Retorna (estado, detalle) donde estado es 'ok', 'parcial' o 'falta'.
@@ -5622,6 +5711,26 @@ def _check_backup_source(ref_dir: Path, ruta_rel: str | None, etiqueta: str) -> 
             return ("parcial", f"Solo {n}/6 archivos")
         return ("falta", "Sin archivos inscritos_*.xlsx")
 
+    if etiqueta == "Primer Curso 2014-2024":
+        try:
+            from etl.mercado_pipeline import (
+                consolidado_primer_curso_contiene_año,
+                ruta_consolidado_primer_curso,
+            )
+
+            ruta_cons = ruta_consolidado_primer_curso(ref_dir)
+            if not ruta_cons.exists():
+                return ("falta", "Consolidado no encontrado")
+            if verificacion_completa:
+                if consolidado_primer_curso_contiene_año(2024, ruta_cons):
+                    return ("ok", "matriculas_primercurso_ESTANDARIZADO.xlsx — 2014-2024")
+                return ("parcial", "Consolidado existe pero no contiene 2024")
+            # Fix 34-C: verificación ligera solo de existencia en el check de arranque.
+            size_mb = ruta_cons.stat().st_size / (1024 * 1024)
+            return ("ok", f"matriculas_primercurso_ESTANDARIZADO.xlsx ({size_mb:.1f} MB)")
+        except Exception as e:
+            return ("falta", f"Error al verificar consolidado: {e}")
+
     if not carpeta.exists():
         return ("falta", "Carpeta no encontrada")
 
@@ -5653,7 +5762,16 @@ class MercadoPipelinePage(ttk.Frame):
         self.cancel_event = threading.Event()
         self.seg_cancel_event = threading.Event()
         self._setup_ui()
-        self._check_checkpoints()
+        # Fix 34-C: diferir checks costosos para no bloquear la UI al abrir la página.
+        self.root.after(0, self._init_async)
+
+    def _init_async(self) -> None:
+        """Inicialización diferida: checkpoints y diagnóstico sin congelar la ventana."""
+        def _worker():
+            self.root.after(0, self._check_checkpoints)
+            self.root.after(50, lambda: self._refresh_diagnostico(verificacion_completa=False))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_resize(self, w: int, h: int) -> None:
         """Ajusta el área de log según altura disponible."""
@@ -5669,7 +5787,12 @@ class MercadoPipelinePage(ttk.Frame):
         except (tk.TclError, AttributeError):
             pass
 
-    def _populate_diagnostico_content(self, diag_card: ttk.Frame, ref_dir: Path | None) -> None:
+    def _populate_diagnostico_content(
+        self,
+        diag_card: ttk.Frame,
+        ref_dir: Path | None,
+        verificacion_completa: bool = False,
+    ) -> None:
         """Añade filas de semáforo y botón refrescar (asume título + subtítulo ya empaquetados)."""
         for w in diag_card.winfo_children()[2:]:
             w.destroy()
@@ -5692,7 +5815,9 @@ class MercadoPipelinePage(ttk.Frame):
             if ref_dir is None:
                 estado, detalle = "falta", "REF_DIR no disponible"
             else:
-                estado, detalle = _check_backup_source(ref_dir, ruta_rel, etiqueta)
+                estado, detalle = _check_backup_source(
+                    ref_dir, ruta_rel, etiqueta, verificacion_completa=verificacion_completa
+                )
 
             if estado == "ok":
                 icon, fg, bg = _icon_ok, _color_ok, _bg_ok
@@ -5727,14 +5852,16 @@ class MercadoPipelinePage(ttk.Frame):
         )
         self.btn_refresh_diag.pack(anchor="w", pady=(8, 0))
 
-    def _refresh_diagnostico(self) -> None:
+    def _refresh_diagnostico(self, verificacion_completa: bool = True) -> None:
         try:
             from etl.config import REF_DIR as _ref
 
             self._diag_ref_dir = _ref
         except Exception:
             self._diag_ref_dir = None
-        self._populate_diagnostico_content(self._diag_card, self._diag_ref_dir)
+        self._populate_diagnostico_content(
+            self._diag_card, self._diag_ref_dir, verificacion_completa=verificacion_completa
+        )
 
     def _setup_ui(self):
         # ── Contenedor raíz: header fijo arriba + área scrollable abajo ──────
@@ -5819,7 +5946,11 @@ class MercadoPipelinePage(ttk.Frame):
             _outputs_dir_diag = None
         self._diag_card = diag_card
         self._diag_ref_dir = _ref_dir_diag
-        self._populate_diagnostico_content(diag_card, _ref_dir_diag)
+        ttk.Label(
+            diag_card,
+            text="Cargando diagnóstico...",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 4))
 
         # ── Card: Checkpoints ────────────────────────────────────────────────
         cp_card = ttk.Frame(main_frame, padding=16, style="Card.TFrame")
@@ -6835,7 +6966,11 @@ class MercadoPipelinePage(ttk.Frame):
             try:
                 from etl.mercado_pipeline import exportar_base_maestra_excel
 
-                resultado = exportar_base_maestra_excel(ruta_salida=ruta)
+                def _progress(msg: str) -> None:
+                    self.root.after(0, lambda m=msg: self._log_message(f"  {m}"))
+                    self.root.after(0, lambda m=msg: self.progress_label_fase1.config(text=m))
+
+                resultado = exportar_base_maestra_excel(ruta_salida=ruta, on_progress=_progress)
 
                 def _ok():
                     self._log_message(f"✓ Excel generado: {resultado.name}")

@@ -154,18 +154,680 @@ def _normalizar_codigo_snies(serie: pd.Series) -> pd.Series:
     )
 
 
+HOJA_CONSOLIDADO_PC = "Sheet 1"
+
+
+def _norm_header(s: object) -> str:
+    s2 = unicodedata.normalize("NFD", str(s))
+    s2 = "".join(ch for ch in s2 if unicodedata.category(ch) != "Mn")
+    return s2.upper().strip()
+
+
+def _normalizar_snies_valor(val: object) -> str | None:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = str(val).strip().upper()
+    s = re.sub(r"\.0$", "", s)
+    if not re.match(r"^\d+$", s):
+        return None
+    return s
+
+
+def ruta_consolidado_primer_curso(ref_dir: Path | None = None) -> Path:
+    base = ref_dir if ref_dir is not None else REF_DIR
+    return base / "backup" / "matriculas primer curso" / "matriculas_primercurso_ESTANDARIZADO.xlsx"
+
+
+def _hoja_primer_curso_snies(wb) -> str:
+    if HOJA_CONSOLIDADO_PC in wb.sheetnames:
+        return HOJA_CONSOLIDADO_PC
+    return next(
+        (
+            s
+            for s in wb.sheetnames
+            if "INDICE" not in str(s).upper() and "ÍNDICE" not in str(s).upper()
+        ),
+        wb.sheetnames[-1],
+    )
+
+
+def _indices_columnas_consolidado(header: tuple) -> dict[str, int | None]:
+    norm_to_idx = {_norm_header(h): i for i, h in enumerate(header) if h is not None}
+
+    def _find(*names: str) -> int | None:
+        for n in names:
+            if n in norm_to_idx:
+                return norm_to_idx[n]
+        return None
+
+    idx_snies = _find("CODIGO_SNIES_DEL_PROGRAMA")
+    if idx_snies is None:
+        for nh, i in norm_to_idx.items():
+            if nh.startswith("CODIGO") and "SNIES" in nh:
+                idx_snies = i
+                break
+
+    idx_ano = _find("ANO", "ANIO", "AÑO")
+    idx_sem = _find("SEMESTRE")
+    idx_pc = None
+    for nh, i in norm_to_idx.items():
+        if "PRIMER" in nh and "CURSO" in nh:
+            idx_pc = i
+            break
+
+    def _find_optional(pred) -> int | None:
+        for nh, i in norm_to_idx.items():
+            if nh.startswith("ID"):
+                continue
+            if pred(nh):
+                return i
+        return None
+
+    idx_ies = _find_optional(
+        lambda nh: "INSTITUC" in nh and "IES" in nh and "PADRE" not in nh
+    )
+    idx_prog = _find_optional(
+        lambda nh: "PROGRAMA" in nh and "ACAD" in nh and "CODIGO" not in nh and "ACRED" not in nh
+    )
+    idx_nivel = _find_optional(lambda nh: "NIVEL" in nh and "FORMAC" in nh)
+    idx_sector = _find_optional(lambda nh: "SECTOR" in nh and "IES" in nh)
+    idx_modalidad = _find_optional(lambda nh: "METODOL" in nh)
+    idx_dpto = _find_optional(lambda nh: "DEPARTAMENTO" in nh and "OFERTA" in nh)
+
+    return {
+        "snies": idx_snies,
+        "ano": idx_ano,
+        "semestre": idx_sem,
+        "pc": idx_pc,
+        "ies": idx_ies,
+        "prog": idx_prog,
+        "nivel": idx_nivel,
+        "sector": idx_sector,
+        "modalidad": idx_modalidad,
+        "dpto": idx_dpto,
+    }
+
+
+def _leer_año_desde_consolidado(year: int, ruta_consolidado: Path) -> pd.Series:
+    """
+    Lee únicamente las filas del año `year` desde matriculas_primercurso_ESTANDARIZADO.xlsx,
+    usando openpyxl en modo read_only para no cargar las 42 columnas completas
+    ni las filas de otros años en memoria.
+
+    Filtra por SEMESTRE en (1, 2), normaliza el código SNIES (misma lógica que
+    _normalizar_codigo_snies), agrupa y suma PRIMER CURSO por programa.
+
+    Returns:
+        pd.Series indexada por SNIES normalizado, name=f"PRIMER_CURSO_{year}".
+        Vacía si el archivo no existe o no hay filas para ese año.
+    """
+    if not ruta_consolidado.exists():
+        log_warning(
+            f"[Fase 1] No se encontró {ruta_consolidado.name} en "
+            "ref/backup/matriculas primer curso/. Columna quedará vacía."
+        )
+        return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
+
+    try:
+        import openpyxl
+
+        acum: dict[str, float] = {}
+        wb = openpyxl.load_workbook(ruta_consolidado, read_only=True, data_only=True)
+        try:
+            ws = wb[_hoja_primer_curso_snies(wb)]
+            row_iter = ws.iter_rows(min_row=1, values_only=True)
+            header = next(row_iter, None)
+            if not header:
+                raise ValueError("archivo consolidado sin encabezado")
+
+            cols = _indices_columnas_consolidado(header)
+            idx_snies, idx_ano, idx_sem, idx_pc = (
+                cols["snies"],
+                cols["ano"],
+                cols["semestre"],
+                cols["pc"],
+            )
+            if any(x is None for x in (idx_snies, idx_ano, idx_sem, idx_pc)):
+                log_warning(
+                    f"[Fase 1] {ruta_consolidado.name}: columnas requeridas no encontradas "
+                    "(codigo_snies_del_programa, AÑO, SEMESTRE, PRIMER CURSO). "
+                    "Columna quedará vacía."
+                )
+                return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
+
+            max_idx = max(idx_snies, idx_ano, idx_sem, idx_pc)
+            for row in row_iter:
+                if not row or len(row) <= max_idx:
+                    continue
+                try:
+                    if int(row[idx_ano]) != year:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    sem = int(row[idx_sem])
+                except (TypeError, ValueError):
+                    continue
+                if sem not in (1, 2):
+                    continue
+                snies = _normalizar_snies_valor(row[idx_snies])
+                if snies is None:
+                    continue
+                try:
+                    pc = float(row[idx_pc]) if row[idx_pc] is not None else 0.0
+                except (TypeError, ValueError):
+                    pc = 0.0
+                acum[snies] = acum.get(snies, 0.0) + pc
+        finally:
+            wb.close()
+
+        if not acum:
+            log_warning(
+                f"[Fase 1] {ruta_consolidado.name}: sin filas para año {year}. "
+                "Columna quedará vacía."
+            )
+            return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
+
+        serie = pd.Series(acum, name=f"PRIMER_CURSO_{year}")
+        log_info(
+            f"[Fase 1] primer_curso_{year} (consolidado): {len(serie):,} programas, "
+            f"{float(serie.sum()):,.0f} matriculados totales (S1+S2)."
+        )
+        return serie
+
+    except Exception as exc:
+        log_warning(
+            f"[Fase 1] Error leyendo año {year} desde consolidado: {exc}. "
+            "Columna quedará vacía."
+        )
+        return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
+
+
+def _cargar_todos_años_consolidado(
+    ruta_consolidado: Path,
+) -> dict[int, pd.Series]:
+    """
+    Lee matriculas_primercurso_ESTANDARIZADO.xlsx en UNA SOLA pasada y devuelve
+    un diccionario {año: pd.Series} con PRIMER_CURSO agregado (S1+S2) por SNIES
+    para cada año presente en el archivo.
+
+    Cada Series tiene:
+        - índice: SNIES normalizado (string, sin sufijo .0)
+        - valores: suma S1+S2 de PRIMER CURSO
+        - name: f"PRIMER_CURSO_{año}"
+
+    Retorna dict vacío si el archivo no existe o no se puede leer.
+    """
+    if not ruta_consolidado.exists():
+        log_warning(
+            f"[Fase 1] No se encontró {ruta_consolidado.name} en "
+            "ref/backup/matriculas primer curso/. Columnas de primer curso vacías."
+        )
+        return {}
+
+    try:
+        import openpyxl
+
+        acum: dict[int, dict[str, float]] = {}
+
+        wb = openpyxl.load_workbook(ruta_consolidado, read_only=True, data_only=True)
+        try:
+            ws = wb[_hoja_primer_curso_snies(wb)]
+            row_iter = ws.iter_rows(min_row=1, values_only=True)
+            header = next(row_iter, None)
+            if not header:
+                raise ValueError("archivo consolidado sin encabezado")
+
+            cols = _indices_columnas_consolidado(header)
+            idx_snies = cols["snies"]
+            idx_ano = cols["ano"]
+            idx_sem = cols["semestre"]
+            idx_pc = cols["pc"]
+
+            if any(x is None for x in (idx_snies, idx_ano, idx_sem, idx_pc)):
+                log_warning(
+                    f"[Fase 1] {ruta_consolidado.name}: columnas requeridas no "
+                    "encontradas (codigo_snies_del_programa, AÑO, SEMESTRE, PRIMER CURSO)."
+                )
+                return {}
+
+            max_idx = max(idx_snies, idx_ano, idx_sem, idx_pc)
+            for row in row_iter:
+                if not row or len(row) <= max_idx:
+                    continue
+                try:
+                    sem = int(row[idx_sem])
+                except (TypeError, ValueError):
+                    continue
+                if sem not in (1, 2):
+                    continue
+                try:
+                    ano = int(row[idx_ano])
+                except (TypeError, ValueError):
+                    continue
+                snies = _normalizar_snies_valor(row[idx_snies])
+                if snies is None:
+                    continue
+                try:
+                    pc = float(row[idx_pc]) if row[idx_pc] is not None else 0.0
+                except (TypeError, ValueError):
+                    pc = 0.0
+                if ano not in acum:
+                    acum[ano] = {}
+                acum[ano][snies] = acum[ano].get(snies, 0.0) + pc
+        finally:
+            wb.close()
+
+        result: dict[int, pd.Series] = {}
+        for ano, datos in acum.items():
+            serie = pd.Series(datos, name=f"PRIMER_CURSO_{ano}")
+            result[ano] = serie
+            log_info(
+                f"[Fase 1] primer_curso_{ano} (consolidado): {len(serie):,} programas, "
+                f"{float(serie.sum()):,.0f} matriculados totales (S1+S2)."
+            )
+
+        if result:
+            log_info(
+                f"[Fase 1] Consolidado leído en una pasada: "
+                f"{len(result)} años ({min(result)}-{max(result)})."
+            )
+        return result
+
+    except Exception as exc:
+        log_warning(
+            f"[Fase 1] Error leyendo consolidado en pasada única: {exc}. "
+            "Columnas de primer curso vacías."
+        )
+        return {}
+
+
 def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
     """
-    Lee primer_curso_{year}.xlsx desde ref/backup/ y retorna una Series
-    {snies_norm -> total_anual (S1+S2)} indexada por código SNIES normalizado
-    (misma lógica que _normalizar_codigo_snies).
-    Retorna Series vacía si el archivo no existe o hay error.
+    Lee PRIMER_CURSO_{year} desde matriculas_primercurso_ESTANDARIZADO.xlsx (ref/backup/matriculas
+    primer curso/). Fuente única desde el Fix 29 — ya no se leen archivos sueltos
+    individuales por año.
+    """
+    ruta_consolidado = ruta_consolidado_primer_curso(ref_dir)
+    return _leer_año_desde_consolidado(year, ruta_consolidado)
 
-    Cobertura soportada: AÑO_INICIO_PRIMER_CURSO..AÑO_FIN_DATOS (ref/backup/matriculas primer curso/).
-    Nombre esperado: `primer_curso_{year}.xlsx`.
-    El layout exacto del header se detecta dinámicamente buscando la fila
-    que contenga 'CODIGO' + 'SNIES' (header=5 sigue siendo la primera apuesta
-    rápida para archivos 2023/2024).
+
+def _detectar_columnas_pc_crudo(
+    df: pd.DataFrame,
+) -> tuple[str | None, str | None, str | None]:
+    df.columns = [str(c).strip() for c in df.columns]
+    col_snies = next(
+        (c for c in df.columns if _norm_header(c).startswith("CODIGO") and "SNIES" in _norm_header(c)),
+        None,
+    ) or next(
+        (c for c in df.columns if "SNIES" in _norm_header(c) and "PROGRAMA" in _norm_header(c)),
+        None,
+    )
+    col_pc = next(
+        (c for c in df.columns if "MATRICULADOS" in _norm_header(c) and "PRIMER" in _norm_header(c)),
+        None,
+    ) or next(
+        (c for c in df.columns if "PRIMER" in _norm_header(c) and "CURSO" in _norm_header(c)),
+        None,
+    )
+    col_sem = next((c for c in df.columns if _norm_header(c) == "SEMESTRE"), None)
+    return col_snies, col_pc, col_sem
+
+
+def _parsear_archivo_primer_curso_crudo(
+    ruta: Path,
+) -> tuple[pd.DataFrame | None, dict[str, object]]:
+    """
+    Parsea un archivo SNIES crudo de primer curso (layout variable por año).
+    Retorna el DataFrame completo con columnas originales, filtrado a semestres 1 y 2.
+    """
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        try:
+            hoja = _hoja_primer_curso_snies(wb)
+        finally:
+            wb.close()
+
+        df_pc = pd.read_excel(ruta, sheet_name=hoja, header=5, dtype=str, engine="openpyxl")
+        col_snies, col_pc, col_sem = _detectar_columnas_pc_crudo(df_pc)
+
+        if not col_snies or not col_pc:
+            preview = pd.read_excel(
+                ruta, sheet_name=hoja, header=None, nrows=30, dtype=str, engine="openpyxl"
+            )
+            header_idx: int | None = None
+            for idx in range(len(preview)):
+                vals = [
+                    str(v) for v in preview.iloc[idx].tolist() if pd.notna(v) and str(v).strip()
+                ]
+                if not vals:
+                    continue
+                if "CODIGO" in _norm_header(vals[0]) and any(
+                    "SNIES" in _norm_header(v) for v in vals
+                ):
+                    header_idx = idx
+                    break
+            if header_idx is not None and header_idx != 5:
+                df_pc = pd.read_excel(
+                    ruta, sheet_name=hoja, header=header_idx, dtype=str, engine="openpyxl"
+                )
+                col_snies, col_pc, col_sem = _detectar_columnas_pc_crudo(df_pc)
+
+        if not col_snies or not col_pc:
+            return None, {
+                "error": "columnas no detectadas",
+                "col_snies": col_snies,
+                "col_pc": col_pc,
+            }
+
+        if col_sem:
+            df_pc = df_pc[df_pc[col_sem].astype(str).str.strip().isin(("1", "2"))].copy()
+
+        return df_pc, {"col_snies": col_snies, "col_pc": col_pc, "col_sem": col_sem}
+
+    except Exception as exc:
+        return None, {"error": str(exc)}
+
+
+def _obtener_esquema_consolidado_pc(ruta: Path | None = None) -> list[str]:
+    """Fila de encabezado (42 columnas) del consolidado existente o esquema por defecto."""
+    ruta = ruta or ruta_consolidado_primer_curso()
+    if ruta.exists():
+        import openpyxl
+
+        wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        try:
+            ws = wb[_hoja_primer_curso_snies(wb)]
+            header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+            return [str(h) if h is not None else "" for h in header]
+        finally:
+            wb.close()
+
+    return [
+        "files",
+        "CÓDIGO DE LA INSTITUCIÓN",
+        "IES_PADRE",
+        "INSTITUCIÓN DE EDUCACIÓN SUPERIOR (IES)",
+        "PRINCIPAL O SECCIONAL",
+        "ID SECTOR IES",
+        "SECTOR IES",
+        "IES ACREDITADA",
+        "ID CARACTER",
+        "CARACTER IES",
+        "CÓDIGO DEL DEPARTAMENTO (IES)",
+        "DEPARTAMENTO DE DOMICILIO DE LA IES",
+        "CÓDIGO DEL MUNICIPIO (IES)",
+        "MUNICIPIO DE DOMICILIO DE LA IES",
+        "codigo_snies_del_programa",
+        "PROGRAMA ACADÉMICO",
+        "PROGRAMA ACREDITADO",
+        "ID NIVEL ACADÉMICO",
+        "NIVEL ACADÉMICO",
+        "ID NIVEL DE FORMACIÓN",
+        "NIVEL DE FORMACIÓN",
+        "ID METODOLOGÍA",
+        "METODOLOGÍA",
+        "ID ÁREA DE CONOCIMIENTO",
+        "ÁREA DE CONOCIMIENTO",
+        "ID NÚCLEO",
+        "NÚCLEO BÁSICO DEL CONOCIMIENTO (NBC)",
+        "CÓDIGO DEL DEPARTAMENTO (PROGRAMA)",
+        "DEPARTAMENTO DE OFERTA DEL PROGRAMA",
+        "CÓDIGO DEL MUNICIPIO (PROGRAMA)",
+        "MUNICIPIO DE OFERTA DEL PROGRAMA",
+        "ID SEXO",
+        "SEXO",
+        "AÑO",
+        "SEMESTRE",
+        "PRIMER CURSO",
+        "ID CINE CAMPO AMPLIO",
+        "DESC CINE CAMPO AMPLIO",
+        "ID CINE CAMPO ESPECIFICO",
+        "DESC CINE CAMPO ESPECIFICO",
+        "ID CINE CAMPO DETALLADO",
+        "DESC CINE CAMPO DETALLADO",
+    ]
+
+
+def _mapeo_columnas_crudo_a_esquema(
+    columnas_crudo: list[str],
+    esquema: list[str],
+) -> tuple[dict[int, int], list[str]]:
+    """
+    Mapea índice de columna del esquema consolidado → índice de columna del archivo crudo.
+    Retorna también la lista de columnas del esquema sin mapeo con confianza.
+    """
+    esquema_norm = {_norm_header(c): i for i, c in enumerate(esquema)}
+    mapping: dict[int, int] = {}
+    mapeadas_crudo: set[int] = set()
+
+    def _asignar(esquema_idx: int, crudo_idx: int) -> None:
+        if esquema_idx not in mapping:
+            mapping[esquema_idx] = crudo_idx
+            mapeadas_crudo.add(crudo_idx)
+
+    for j, col in enumerate(columnas_crudo):
+        nc = _norm_header(col)
+        if nc in esquema_norm:
+            _asignar(esquema_norm[nc], j)
+            continue
+        if nc.startswith("CODIGO") and "SNIES" in nc and "PROGRAMA" in nc:
+            tgt = esquema_norm.get("CODIGO_SNIES_DEL_PROGRAMA")
+            if tgt is not None:
+                _asignar(tgt, j)
+        elif "PRIMER" in nc and "CURSO" in nc:
+            tgt = esquema_norm.get("PRIMER CURSO")
+            if tgt is not None:
+                _asignar(tgt, j)
+        elif nc == "SEMESTRE":
+            tgt = esquema_norm.get("SEMESTRE")
+            if tgt is not None:
+                _asignar(tgt, j)
+        elif nc in ("ANO", "ANIO", "AÑO"):
+            tgt = esquema_norm.get("ANO") or esquema_norm.get("AÑO")
+            if tgt is not None:
+                _asignar(tgt, j)
+
+    sin_mapeo = [
+        esquema[i]
+        for i in range(len(esquema))
+        if i not in mapping
+        and _norm_header(esquema[i])
+        not in ("ANO", "AÑO", "SEMESTRE", "PRIMER CURSO", "CODIGO_SNIES_DEL_PROGRAMA")
+    ]
+    return mapping, sin_mapeo
+
+
+def _construir_filas_consolidado(
+    df_crudo: pd.DataFrame,
+    esquema: list[str],
+    año: int,
+) -> tuple[list[list], int, float, list[str]]:
+    """Convierte filas del archivo crudo al esquema de 42 columnas del consolidado."""
+    columnas_crudo = [str(c) for c in df_crudo.columns]
+    mapping, sin_mapeo = _mapeo_columnas_crudo_a_esquema(columnas_crudo, esquema)
+    esquema_norm = {_norm_header(c): i for i, c in enumerate(esquema)}
+
+    idx_ano = esquema_norm.get("ANO") or esquema_norm.get("AÑO")
+    idx_sem = esquema_norm.get("SEMESTRE")
+    idx_snies = esquema_norm.get("CODIGO_SNIES_DEL_PROGRAMA")
+    idx_pc = esquema_norm.get("PRIMER CURSO")
+
+    filas: list[list] = []
+    snies_vistos: set[str] = set()
+    total_est = 0.0
+
+    for _, row in df_crudo.iterrows():
+        fila = [None] * len(esquema)
+        for esq_i, crudo_i in mapping.items():
+            val = row.iloc[crudo_i]
+            if pd.notna(val) and str(val).strip():
+                fila[esq_i] = val
+        if idx_ano is not None:
+            fila[idx_ano] = año
+        if idx_snies is not None:
+            snies = _normalizar_snies_valor(fila[idx_snies])
+            if snies is None:
+                continue
+            fila[idx_snies] = snies
+            snies_vistos.add(snies)
+        if idx_pc is not None:
+            try:
+                pc = float(fila[idx_pc]) if fila[idx_pc] is not None else 0.0
+            except (TypeError, ValueError):
+                pc = 0.0
+            fila[idx_pc] = pc
+            total_est += pc
+        if idx_sem is not None and fila[idx_sem] is not None:
+            try:
+                fila[idx_sem] = int(float(str(fila[idx_sem]).strip()))
+            except (TypeError, ValueError):
+                pass
+        filas.append(fila)
+
+    return filas, len(snies_vistos), total_est, sin_mapeo
+
+
+def consolidado_primer_curso_contiene_año(año: int, ruta: Path | None = None) -> bool:
+    """True si el consolidado existe y tiene al menos una fila con AÑO == año."""
+    ruta = ruta or ruta_consolidado_primer_curso()
+    if not ruta.exists():
+        return False
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        try:
+            ws = wb[_hoja_primer_curso_snies(wb)]
+            row_iter = ws.iter_rows(min_row=1, values_only=True)
+            header = next(row_iter, None)
+            if not header:
+                return False
+            idx_ano = _indices_columnas_consolidado(header)["ano"]
+            if idx_ano is None:
+                return False
+            for row in row_iter:
+                if not row or len(row) <= idx_ano:
+                    continue
+                try:
+                    if int(row[idx_ano]) == año:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
+        finally:
+            wb.close()
+    except Exception:
+        return False
+
+
+def actualizar_consolidado_primer_curso(ruta_archivo_crudo: Path, año: int) -> dict:
+    """
+    Parsea un archivo crudo de SNIES de un año específico (mismo formato variable
+    que los archivos sueltos históricos) y lo fusiona dentro de
+    matriculas_primercurso_ESTANDARIZADO.xlsx, reemplazando las filas de ese año si ya existían.
+
+    No reescribe ni recalcula los años que no sean `año` — esas filas se preservan
+    intactas tal como estaban, incluyendo las 38 columnas adicionales que el
+    pipeline no usa pero el archivo conserva.
+
+    Returns:
+        dict: {"año": año, "programas": n_programas_unicos, "filas_nuevas": n,
+               "total_estudiantes": suma, "año_reemplazado": bool,
+               "columnas_sin_mapeo": list}
+    """
+    ruta_archivo_crudo = Path(ruta_archivo_crudo)
+    ruta_consolidado = ruta_consolidado_primer_curso()
+
+    df_crudo, info = _parsear_archivo_primer_curso_crudo(ruta_archivo_crudo)
+    if df_crudo is None or len(df_crudo) == 0:
+        err = info.get("error", "sin filas")
+        raise ValueError(
+            f"No se pudo parsear {ruta_archivo_crudo.name}: {err}"
+        )
+
+    esquema = _obtener_esquema_consolidado_pc(
+        ruta_consolidado if ruta_consolidado.exists() else None
+    )
+    nuevas_filas, n_programas, total_est, cols_sin_mapeo = _construir_filas_consolidado(
+        df_crudo, esquema, año
+    )
+    if not nuevas_filas:
+        raise ValueError(
+            f"El archivo crudo no produjo filas válidas para el año {año}."
+        )
+
+    if cols_sin_mapeo:
+        log_warning(
+            "[Consolidado PC] Columnas del esquema sin mapeo desde el archivo crudo "
+            f"(quedarán vacías en filas nuevas): {', '.join(cols_sin_mapeo[:12])}"
+            + ("..." if len(cols_sin_mapeo) > 12 else "")
+        )
+
+    año_reemplazado = False
+    filas_preservadas: list[tuple] = []
+
+    if ruta_consolidado.exists():
+        import openpyxl
+
+        wb = openpyxl.load_workbook(ruta_consolidado, read_only=True, data_only=True)
+        try:
+            ws = wb[_hoja_primer_curso_snies(wb)]
+            row_iter = ws.iter_rows(values_only=True)
+            header_exist = next(row_iter, None)
+            if header_exist:
+                esquema = [str(h) if h is not None else "" for h in header_exist]
+            cols = _indices_columnas_consolidado(header_exist or tuple())
+            idx_ano = cols["ano"]
+            for row in row_iter:
+                if row is None:
+                    continue
+                if idx_ano is not None and len(row) > idx_ano:
+                    try:
+                        if int(row[idx_ano]) == año:
+                            año_reemplazado = True
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                filas_preservadas.append(row)
+        finally:
+            wb.close()
+
+    ruta_consolidado.parent.mkdir(parents=True, exist_ok=True)
+
+    from openpyxl import Workbook
+
+    wb_out = Workbook(write_only=True)
+    ws_out = wb_out.create_sheet(title=HOJA_CONSOLIDADO_PC)
+    ws_out.append(esquema)
+    for row in filas_preservadas:
+        ws_out.append(list(row))
+    for row in nuevas_filas:
+        ws_out.append(row)
+    wb_out.save(ruta_consolidado)
+
+    log_info(
+        f"[Consolidado PC] Año {año}: {n_programas:,} programas, "
+        f"{len(nuevas_filas):,} filas, {total_est:,.0f} estudiantes "
+        f"({'reemplazado' if año_reemplazado else 'nuevo'})."
+    )
+
+    return {
+        "año": año,
+        "programas": n_programas,
+        "filas_nuevas": len(nuevas_filas),
+        "total_estudiantes": total_est,
+        "año_reemplazado": año_reemplazado,
+        "columnas_sin_mapeo": cols_sin_mapeo,
+    }
+
+
+def _leer_primer_curso_anual_legacy_archivo_suelto(year: int, ref_dir: Path) -> pd.Series:
+    """
+    Lectura legacy desde primer_curso_{year}.xlsx individual.
+    Solo para auditoría — el pipeline ya no la invoca (Fix 29).
     """
     pc_dir = ref_dir / "backup" / "matriculas primer curso"
     candidatos = [
@@ -176,84 +838,43 @@ def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
     ]
     ruta = next((p for p in candidatos if p.exists()), None)
     if ruta is None:
-        log_warning(
-            f"[Fase 1] primer_curso_{year}.xlsx no encontrado en ref/backup/. "
-            "Columna quedará vacía."
-        )
         return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
 
     try:
         import openpyxl
-        import unicodedata as _ud
-
-        def _norm_up(s: str) -> str:
-            s2 = _ud.normalize("NFD", str(s))
-            s2 = "".join(ch for ch in s2 if _ud.category(ch) != "Mn")
-            return s2.upper().strip()
 
         wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
         try:
-            hoja = next(
-                (
-                    s
-                    for s in wb.sheetnames
-                    if "INDICE" not in str(s).upper() and "ÍNDICE" not in str(s).upper()
-                ),
-                wb.sheetnames[-1],
-            )
+            hoja = _hoja_primer_curso_snies(wb)
         finally:
             wb.close()
 
-        # Detección de columnas (tolerante a layouts viejos): primero probamos
-        # header=5 (rápido, confirmado para 2023/2024); si las columnas clave
-        # no aparecen, escaneamos las primeras 30 filas igual que el scraper.
-        def _detectar_columnas(df: pd.DataFrame) -> tuple[str | None, str | None, str | None]:
-            df.columns = [str(c).strip() for c in df.columns]
-            col_snies = next(
-                (c for c in df.columns if _norm_up(c).startswith("CODIGO") and "SNIES" in _norm_up(c)),
-                None,
-            ) or next(
-                (c for c in df.columns if "SNIES" in _norm_up(c) and "PROGRAMA" in _norm_up(c)),
-                None,
-            )
-            col_pc = next(
-                (c for c in df.columns if "MATRICULADOS" in _norm_up(c) and "PRIMER" in _norm_up(c)),
-                None,
-            ) or next(
-                (c for c in df.columns if "PRIMER" in _norm_up(c) and "CURSO" in _norm_up(c)),
-                None,
-            )
-            col_sem = next((c for c in df.columns if _norm_up(c) == "SEMESTRE"), None)
-            return col_snies, col_pc, col_sem
-
         df_pc = pd.read_excel(ruta, sheet_name=hoja, header=5, dtype=str, engine="openpyxl")
-        col_snies, col_pc, col_sem = _detectar_columnas(df_pc)
+        col_snies, col_pc, col_sem = _detectar_columnas_pc_crudo(df_pc)
 
         if not col_snies or not col_pc:
-            # Fallback: detectar header dinámicamente
             preview = pd.read_excel(
                 ruta, sheet_name=hoja, header=None, nrows=30, dtype=str, engine="openpyxl"
             )
             header_idx: int | None = None
             for idx in range(len(preview)):
-                vals = [str(v) for v in preview.iloc[idx].tolist() if pd.notna(v) and str(v).strip()]
+                vals = [
+                    str(v) for v in preview.iloc[idx].tolist() if pd.notna(v) and str(v).strip()
+                ]
                 if not vals:
                     continue
-                if "CODIGO" in _norm_up(vals[0]) and any("SNIES" in _norm_up(v) for v in vals):
+                if "CODIGO" in _norm_header(vals[0]) and any(
+                    "SNIES" in _norm_header(v) for v in vals
+                ):
                     header_idx = idx
                     break
             if header_idx is not None and header_idx != 5:
                 df_pc = pd.read_excel(
                     ruta, sheet_name=hoja, header=header_idx, dtype=str, engine="openpyxl"
                 )
-                col_snies, col_pc, col_sem = _detectar_columnas(df_pc)
+                col_snies, col_pc, col_sem = _detectar_columnas_pc_crudo(df_pc)
 
         if not col_snies or not col_pc:
-            log_warning(
-                f"[Fase 1] primer_curso_{year}: columnas no detectadas "
-                f"(buscadas: 'CÓDIGO SNIES DEL PROGRAMA', 'MATRICULADOS PRIMER CURSO'). "
-                f"Columna quedará vacía."
-            )
             return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
 
         use_cols = [col_snies, col_pc] + ([col_sem] if col_sem else [])
@@ -268,15 +889,9 @@ def _leer_primer_curso_anual(year: int, ref_dir: Path) -> pd.Series:
 
         serie = df_pc.groupby("SNIES", sort=False)["PC"].sum()
         serie.name = f"PRIMER_CURSO_{year}"
-
-        log_info(
-            f"[Fase 1] primer_curso_{year}: {len(serie):,} programas, "
-            f"{float(serie.sum()):,.0f} matriculados totales (S1+S2)."
-        )
         return serie
 
-    except Exception as exc:
-        log_warning(f"[Fase 1] Error leyendo primer_curso_{year}: {exc}. Columna quedará vacía.")
+    except Exception:
         return pd.Series(dtype=float, name=f"PRIMER_CURSO_{year}")
 
 
@@ -779,18 +1394,20 @@ def run_fase1() -> pd.DataFrame:
         df_base.loc[mask_cruce_snies, "REQUIERE_REVISION"] = False
 
     # ── Primer curso AÑO_INICIO_PRIMER_CURSO..AÑO_FIN_DATOS ──────────────────
-    # Fuente: ref/backup/matriculas primer curso/primer_curso_{year}.xlsx.
-    # Agrega S1+S2 por CÓDIGO_SNIES_DEL_PROGRAMA mediante _leer_primer_curso_anual,
-    # que detecta el header dinámicamente y tolera el archivo 2015 sin guión bajo.
+    # Fuente: ref/backup/matriculas primer curso/matriculas_primercurso_ESTANDARIZADO.xlsx (Fix 29).
+    # Una pasada con _cargar_todos_años_consolidado; luego map por año en memoria (Fix 29.3).
     # Idempotente: borra la columna si ya existe antes de re-añadirla.
-    # Si un archivo no existe se loggea warning y la columna queda con NaN.
+    # Si el archivo no existe se loggea warning y las columnas quedan con NaN.
     _SNIES_COL = "CÓDIGO_SNIES_DEL_PROGRAMA"
     _snies_norm_base = _normalizar_codigo_snies(df_base[_SNIES_COL])
+    _ruta_consolidado = ruta_consolidado_primer_curso(REF_DIR)
+    _todas_series_pc = _cargar_todos_años_consolidado(_ruta_consolidado)
+
     for _pc_year in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
         _col_out = f"PRIMER_CURSO_{_pc_year}"
         if _col_out in df_base.columns:
             df_base.drop(columns=[_col_out], inplace=True)
-        _serie_pc = _leer_primer_curso_anual(_pc_year, REF_DIR)
+        _serie_pc = _todas_series_pc.get(_pc_year, pd.Series(dtype=float, name=_col_out))
         df_base[_col_out] = _snies_norm_base.map(_serie_pc)
         _n_con_dato = int(df_base[_col_out].notna().sum())
         _n_base = len(df_base)
@@ -912,7 +1529,8 @@ def run_fase2() -> None:
     any_matriculas = False
     any_ole = False
 
-    # Scraper A: matrículas por semestre + inscritos anual (S1+S2) + primer_curso/graduados por semestre
+    # Scraper A: matrículas por semestre + inscritos anual (S1+S2) + graduados por semestre.
+    # Primer curso va en bucle aparte (rango 2014-2024) — ver más abajo.
     for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         try:
             df_ins = scraper_mat.download_inscritos(year)
@@ -928,17 +1546,24 @@ def run_fase2() -> None:
             except Exception as e:
                 log_warning(f"Matriculados {year}-{semestre}: {e}. Continuando.")
             try:
-                df_pc = scraper_mat.download_primer_curso(year, semestre)
-                if df_pc is not None and len(df_pc) > 0:
-                    any_matriculas = True
-            except Exception as e:
-                log_warning(f"Primer curso {year}-{semestre}: {e}. Continuando.")
-            try:
                 df_grad = scraper_mat.download_graduados(year, semestre)
                 if df_grad is not None and len(df_grad) > 0:
                     any_matriculas = True
             except Exception as e:
                 log_warning(f"Graduados {year}-{semestre}: {e}. Continuando.")
+
+    # Primer curso: rango completo desde AÑO_INICIO_PRIMER_CURSO (2014).
+    # Las demás fuentes (inscritos, matrículas, graduados) siguen limitadas a
+    # AÑO_INICIO_HISTORICO porque no existe histórico anterior a 2019 para ellas.
+    _años_primer_curso = range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1)
+    for year in _años_primer_curso:
+        for semestre in (1, 2):
+            try:
+                df_pc = scraper_mat.download_primer_curso(year, semestre)
+                if df_pc is not None and len(df_pc) > 0:
+                    any_matriculas = True
+            except Exception as e:
+                log_warning(f"Primer curso {year}-{semestre}: {e}. Continuando.")
 
     # Scraper B: indicadores OLE (lista SNIES desde checkpoint Fase 1)
     snies_list = []
@@ -1221,8 +1846,11 @@ def run_fase3() -> None:
                 how="left",
             )
 
-    # 3.2b Primer curso por año y semestre (2019-2024)
-    for year in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
+    # 3.2b Primer curso por año y semestre (AÑO_INICIO_PRIMER_CURSO..AÑO_FIN_DATOS, Fix 26.1).
+    # Rango ampliado respecto a inscritos/matrícula porque primer_curso sí tiene histórico
+    # desde 2014 vía matriculas_primercurso_ESTANDARIZADO.xlsx — usado para la regresión de
+    # proyección a 5 años (Fix 26), no para AAGR_ROBUSTO ni scoring (que siguen en 2019-2024).
+    for year in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
         pc1 = _cargar_csv_raw(raw_dir, f"primer_curso_{year}_1.csv")
         pc2 = _cargar_csv_raw(raw_dir, f"primer_curso_{year}_2.csv")
         for df_pc in (pc1, pc2):
@@ -1628,6 +2256,126 @@ def run_fase3() -> None:
     log_etapa_completada("Fase 3: Consolidación en sábana única", f"{n} filas")
 
 
+def _proyectar_primer_curso(ag: pd.DataFrame, año_fin_proyeccion: int = 2030) -> pd.DataFrame:
+    """
+    Proyecta primer_curso por categoría usando el modelo que mejor ajuste a la serie
+    histórica completa AÑO_INICIO_PRIMER_CURSO..AÑO_FIN_DATOS.
+
+    Fix 33: modelo híbrido. Para cada categoría se ajustan dos modelos con el mismo
+    número de parámetros (2) y se elige el de mayor R²:
+
+      - Lineal:      y = β₁·t + β₀            (t = año calendario)
+      - Logarítmica: y = a·ln(t − 2013) + b   (t − 2013 ∈ {1, 2, ..., 11})
+
+    Agrega las columnas:
+      - PROYECCION_PC_{año}       para año en AÑO_FIN_DATOS+1 .. año_fin_proyeccion
+      - PENDIENTE_PROYECCION      promedio de estudiantes ganados/perdidos por año
+                                  respecto al último dato real (AÑO_FIN_DATOS):
+                                  (PROYECCION_PC_{fin} − PC_{AÑO_FIN_DATOS}) / n_años
+                                  Positivo = gana, negativo = pierde. Igual para ambos
+                                  modelos → interpretación siempre en est/año.
+      - R2_PROYECCION             R² del modelo ganador (el usado para proyectar)
+      - TIPO_PROYECCION           Etiqueta de dirección del mercado proyectado,
+                                  calculada sobre PENDIENTE_PROYECCION:
+                                  'EXPANSION'     si pendiente > +50 est./año
+                                  'CRECIENTE'     si +10 < pendiente <= +50
+                                  'ESTABLE'       si -10 <= pendiente <= +10
+                                  'DECRECIENTE'   si -20 <= pendiente < -10
+                                  'CONTRACCION'   si pendiente < -20
+                                  'SIN_PROYECCION' si no hay suficientes datos
+    """
+    pc_cols = {
+        y: f"suma_primer_curso_{y}"
+        for y in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1)
+        if f"suma_primer_curso_{y}" in ag.columns
+    }
+
+    años_proyeccion = list(range(AÑO_FIN_DATOS + 1, año_fin_proyeccion + 1))
+    n_años_horizonte = año_fin_proyeccion - AÑO_FIN_DATOS
+
+    for y in años_proyeccion:
+        ag[f"PROYECCION_PC_{y}"] = np.nan
+    ag["PENDIENTE_PROYECCION"] = np.nan
+    ag["R2_PROYECCION"] = np.nan
+    ag["PROYECCION_CONFIABLE"] = False   # interno — log de auditoría
+    ag["MODELO_PROYECCION"] = ""         # interno — log de auditoría
+    ag["TIPO_PROYECCION"] = "SIN_PROYECCION"
+
+    col_pc_fin_real = f"suma_primer_curso_{AÑO_FIN_DATOS}"
+
+    for idx in ag.index:
+        pts = [
+            (yr, ag.at[idx, col])
+            for yr, col in pc_cols.items()
+            if pd.notna(ag.at[idx, col]) and ag.at[idx, col] > 0
+        ]
+        if len(pts) < 3:
+            continue
+
+        xs_yr = np.array([p[0] for p in pts], dtype=float)
+        ys = np.array([p[1] for p in pts], dtype=float)
+        ss_tot = np.sum((ys - ys.mean()) ** 2)
+
+        coef_lin = np.polyfit(xs_yr, ys, 1)
+        pred_lin = np.polyval(coef_lin, xs_yr)
+        r2_lin = (1 - np.sum((ys - pred_lin) ** 2) / ss_tot) if ss_tot > 0 else 0.0
+
+        xs_log = np.log(xs_yr - 2013)
+        coef_log = np.polyfit(xs_log, ys, 1)
+        pred_log = np.polyval(coef_log, xs_log)
+        r2_log = (1 - np.sum((ys - pred_log) ** 2) / ss_tot) if ss_tot > 0 else 0.0
+
+        usar_log = r2_log > r2_lin
+        r2_ganador = r2_log if usar_log else r2_lin
+
+        ag.at[idx, "R2_PROYECCION"] = r2_ganador
+        ag.at[idx, "PROYECCION_CONFIABLE"] = bool(r2_ganador >= 0.3 and len(pts) >= 6)
+        ag.at[idx, "MODELO_PROYECCION"] = "LOGARITMICA" if usar_log else "LINEAL"
+
+        for y in años_proyeccion:
+            if usar_log:
+                valor = np.polyval(coef_log, np.log(y - 2013))
+            else:
+                valor = np.polyval(coef_lin, y)
+            ag.at[idx, f"PROYECCION_PC_{y}"] = max(0, round(valor)) if valor > 0 else 0
+
+        pc_real_2024 = ag.at[idx, col_pc_fin_real] if col_pc_fin_real in ag.columns else np.nan
+        proy_fin = ag.at[idx, f"PROYECCION_PC_{año_fin_proyeccion}"]
+
+        if pd.notna(pc_real_2024) and pd.notna(proy_fin):
+            ag.at[idx, "PENDIENTE_PROYECCION"] = (
+                (float(proy_fin) - float(pc_real_2024)) / n_años_horizonte
+            )
+
+    # Fix 35: TIPO_PROYECCION — etiqueta de dirección del mercado proyectado.
+    def _clasificar_tipo_proyeccion(pend: float) -> str:
+        if pd.isna(pend):
+            return "SIN_PROYECCION"
+        if pend > 50:
+            return "EXPANSION"
+        if pend > 10:
+            return "CRECIENTE"
+        if pend >= -10:
+            return "ESTABLE"
+        if pend >= -20:
+            return "DECRECIENTE"
+        return "CONTRACCION"
+
+    ag["TIPO_PROYECCION"] = ag["PENDIENTE_PROYECCION"].apply(_clasificar_tipo_proyeccion)
+
+    n_log = (ag["MODELO_PROYECCION"] == "LOGARITMICA").sum()
+    n_lin = (ag["MODELO_PROYECCION"] == "LINEAL").sum()
+    n_conf = int(ag["PROYECCION_CONFIABLE"].sum())
+    dist_tipo = ag["TIPO_PROYECCION"].value_counts().to_dict()
+    log_info(
+        f"Proyección híbrida {AÑO_FIN_DATOS + 1}-{año_fin_proyeccion}: "
+        f"{n_conf} de {len(ag)} categorías con R² ≥ 0.3. "
+        f"Modelo lineal: {n_lin} | logarítmico: {n_log}. "
+        f"Tipos: {dist_tipo}."
+    )
+    return ag
+
+
 def run_fase4_desde_sabana(
     df: pd.DataFrame,
     modo_local: bool = False,
@@ -1703,6 +2451,23 @@ def run_fase4_desde_sabana(
         if c in df.columns:
             simple_agg[f"inscritos_{y}_suma"] = pd.NamedAgg(column=c, aggfunc="sum")
             simple_agg[f"inscritos_{y}_prom"] = pd.NamedAgg(column=c, aggfunc="mean")
+
+    # Fix 26: suma de primer_curso 2014-2018 a nivel categoría, solo para la serie histórica
+    # completa usada en la proyección lineal. No se calcula prom_primer_curso para estos años
+    # porque no entran al AAGR_ROBUSTO ni al scoring — únicamente alimentan PROYECCION_PC_2029.
+    _años_pre_historico = list(range(AÑO_INICIO_PRIMER_CURSO, AÑO_INICIO_HISTORICO))
+    _faltan_pre = [y for y in _años_pre_historico if f"primer_curso_{y}" not in df.columns]
+    if len(_faltan_pre) > 2:
+        log_warning(
+            f"[Fix 26] Faltan {len(_faltan_pre)} de {len(_años_pre_historico)} columnas "
+            f"primer_curso_{AÑO_INICIO_PRIMER_CURSO}-{AÑO_INICIO_HISTORICO - 1} en la sábana "
+            f"({', '.join(str(y) for y in _faltan_pre)}) — la regresión de proyección "
+            f"usará menos puntos históricos."
+        )
+    for y in _años_pre_historico:
+        c = f"primer_curso_{y}"
+        if c in df.columns:
+            simple_agg[f"suma_primer_curso_{y}"] = pd.NamedAgg(column=c, aggfunc="sum")
 
     for y in range(AÑO_INICIO_HISTORICO, AÑO_FIN_DATOS + 1):
         c = f"primer_curso_{y}"
@@ -2139,6 +2904,64 @@ def run_fase4_desde_sabana(
         ag["SEÑAL_TENDENCIA"] = "SIN_DATO"
         log_info("Momentum YoY: no se encontraron columnas suma_primer_curso_2023/2024.")
 
+    # Fix 26: SEÑAL_TENDENCIA_POST_PANDEMIA — igual mecanismo que SEÑAL_TENDENCIA, pero el AAGR
+    # de referencia excluye las variaciones de pandemia (2019→2020) y rebote (2020→2021).
+    # Base fija 2021; variaciones desde 2022 hasta AÑO_FIN_DATOS.
+    _AÑO_BASE_POST_PANDEMIA = 2021
+    _años_post = list(range(_AÑO_BASE_POST_PANDEMIA + 1, AÑO_FIN_DATOS + 1))
+    _var_post_cols = [
+        f"var_primer_curso_{y}" for y in _años_post if f"var_primer_curso_{y}" in ag.columns
+    ]
+
+    if len(_var_post_cols) == len(_años_post) and f"suma_primer_curso_{AÑO_FIN_DATOS}" in ag.columns:
+        ag["AAGR_post_pandemia"] = ag[_var_post_cols].mean(axis=1)
+
+        if f"var_yoy_{AÑO_FIN_DATOS}" in ag.columns:
+            ag["diferencial_tendencia_post_pandemia"] = (
+                ag[f"var_yoy_{AÑO_FIN_DATOS}"] - ag["AAGR_post_pandemia"]
+            )
+        else:
+            ag["diferencial_tendencia_post_pandemia"] = np.nan
+
+        def _señal_post_pandemia(row: pd.Series) -> str:
+            yoy = row.get(f"var_yoy_{AÑO_FIN_DATOS}", np.nan)
+            dif = row.get("diferencial_tendencia_post_pandemia", np.nan)
+            if pd.isna(yoy):
+                return "SIN_DATO"
+            if yoy >= 0.10 and (pd.isna(dif) or dif >= -0.05):
+                return "ACELERANDO"
+            if yoy >= 0.00 and not pd.isna(dif) and dif < -0.10:
+                return "DESACELERANDO"
+            if yoy >= 0.00:
+                return "ESTABLE"
+            if yoy < 0.00 and not pd.isna(dif) and dif < -0.10:
+                return "EN_DECLIVE"
+            return "CONTRACCION"
+
+        ag["SEÑAL_TENDENCIA_POST_PANDEMIA"] = ag.apply(_señal_post_pandemia, axis=1)
+
+        if "TIPO_CRECIMIENTO" in ag.columns:
+            _mask_sin_act = ag["TIPO_CRECIMIENTO"].isin(["EXTINTA", "SIN_ACTIVIDAD"])
+            ag.loc[_mask_sin_act, "SEÑAL_TENDENCIA_POST_PANDEMIA"] = "SIN_ACTIVIDAD"
+
+        log_info(
+            "SEÑAL_TENDENCIA_POST_PANDEMIA calculada (base AAGR 2021-"
+            f"{AÑO_FIN_DATOS}). Distribución: "
+            f"{ag['SEÑAL_TENDENCIA_POST_PANDEMIA'].value_counts().to_dict()}"
+        )
+    else:
+        ag["AAGR_post_pandemia"] = np.nan
+        ag["diferencial_tendencia_post_pandemia"] = np.nan
+        ag["SEÑAL_TENDENCIA_POST_PANDEMIA"] = "SIN_DATO"
+        log_warning(
+            "SEÑAL_TENDENCIA_POST_PANDEMIA: faltan columnas var_primer_curso post-pandemia. "
+            f"Esperadas: var_primer_curso_{_años_post}. "
+            "Verificar que AÑO_FIN_DATOS sea 2024 o posterior."
+        )
+
+    # Fix 33: proyección híbrida 2025-2030 (serie completa 2014-2024)
+    ag = _proyectar_primer_curso(ag)
+
     # Bloque B: pct_no_matriculados y var_inscritos
     # Fórmula: pct = (inscritos - primer_curso) / inscritos
     # Comparar inscritos vs primer_curso (no vs matricula_total):
@@ -2523,6 +3346,38 @@ _BLOQUES_TOTAL = [
     ]),
 ]
 
+_AÑO_FIN_PROYECCION_FIX26 = 2030
+_FIX26_POST_PANDEMIA_COLS = ["SEÑAL_TENDENCIA_POST_PANDEMIA", "AAGR_post_pandemia"]
+# Fix 26/33/35/36: proyecciones en total, total_esp, total_mae y total_pregrado.
+_FIX26_PROYECCION_COLS = (
+    [f"PROYECCION_PC_{y}" for y in range(AÑO_FIN_DATOS + 1, _AÑO_FIN_PROYECCION_FIX26 + 1)]
+    + ["PENDIENTE_PROYECCION", "R2_PROYECCION", "TIPO_PROYECCION"]
+    # PROYECCION_CONFIABLE y MODELO_PROYECCION: internos, no se exportan al Excel.
+)
+
+# Fix 36: proyecciones y señal post-pandemia también en total_esp, total_mae y total_pregrado.
+_HOJAS_CON_PROYECCION = frozenset({
+    "total", "total_esp", "total_mae", "total_pregrado",
+})
+
+
+def _bloques_hoja_total(sheet_name: str) -> list[tuple[str, list[str]]]:
+    """Bloques de columnas para exportación de hojas de análisis de mercado."""
+    bloques: list[tuple[str, list[str]]] = []
+    for block_name, cols in _BLOQUES_TOTAL:
+        if sheet_name in _HOJAS_CON_PROYECCION and block_name == "PARTICIPACIÓN Y CRECIMIENTO":
+            cols_out: list[str] = []
+            for c in cols:
+                cols_out.append(c)
+                if c == "SEÑAL_TENDENCIA":
+                    cols_out.extend(_FIX26_POST_PANDEMIA_COLS)
+            bloques.append((block_name, cols_out))
+            bloques.append(("PROYECCIÓN 2025-2030", _FIX26_PROYECCION_COLS))
+        else:
+            bloques.append((block_name, cols))
+    return bloques
+
+
 HEADERS_CONTEXTO_NACIONAL = {
     "CATEGORIA_FINAL": "Categoría de mercado",
     "calificacion_final": "Calificación en este segmento (1-5)",
@@ -2617,10 +3472,11 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
         ("AAGR primer curso (robusto)", "S. AAGR", "20%",
          f"Crecimiento anual promedio histórico del primer_curso "
          f"{AÑO_INICIO_HISTORICO}-{_yr_fin}. "
-         f"Umbrales diferenciados por nivel (ESP / MAE) y por banda de tamaño "
-         f"(NICHO / EMERGENTE / ESTABLECIDO / CONSOLIDADO). "
-         f"Cada categoría compite contra mercados de tamaño similar. "
-         f"La tabla muestra los umbrales de la banda ESTABLECIDO (400–1.499 est.)."),
+         f"Para categorías con base histórica pequeña se usa CAGR en lugar de AAGR "
+         f"(ver columna Tipo de mercado). "
+         f"Umbrales fijos iguales para todos los niveles y tipos de mercado: "
+         f"≤ 0% → score 1 · ≤ 4% → score 2 · ≤ 18% → score 3 · "
+         f"≤ 30% → score 4 · > 30% → score 5."),
         ("Salario promedio (SMLMV)", "S. Salario", "15%",
          "Salario promedio de egresados en SMLMV, según OLE. "
          "Indica el retorno laboral del área de conocimiento."),
@@ -2662,8 +3518,8 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
         "Score", "Peso",
         f"Prom. primer curso {_yr_fin}\n(S. Primer curso, 30%)\n— ESP",
         f"Prom. primer curso {_yr_fin}\n(S. Primer curso, 30%)\n— MAE",
-        "AAGR primer\ncurso robusto\n(S. AAGR, 20%) — ESP",
-        "AAGR primer\ncurso robusto\n(S. AAGR, 20%) — MAE",
+        "AAGR primer\ncurso robusto\n(S. AAGR, 20%)\n— todos los niveles",
+        "AAGR primer\ncurso robusto\n(S. AAGR, 20%)\n— todos los niveles",
         "Salario\n(SMLMV)\n(S. Salario, 15%)",
         f"% Inscritos\nno matr. {_yr_fin}\n(S. No matr., 10%)",
         "N° programas\nen mercado\n(S. N° Prog., 5%)",
@@ -2675,11 +3531,11 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
     fila += 1
 
     UMBRALES = [
-        (1, "0-1.3",  "≤ 9.89",  "≤ 7.93",  "≤ 1.5%",   "≤ -15.4%", "≤ 2 SMLMV", "> 50%", "> 32", "< -60%"),
-        (2, "1.3-2.3","≤ 19.08", "≤ 9.78",  "≤ 5.9%",   "≤ -5.8%",  "≤ 3 SMLMV", "≤ 50%", "≤ 32", "< -40%"),
-        (3, "2.3-3.3","≤ 29.90", "≤ 12.76", "≤ 11.7%",  "≤ -0.3%",  "≤ 5 SMLMV", "≤ 30%", "≤ 18", "< -15%"),
-        (4, "3.3-4.3","≤ 43.87", "≤ 18.85", "≤ 16.2%",  "≤ 3.8%",   "≤ 8 SMLMV", "≤ 20%", "≤ 10", "< +20%"),
-        (5, "4.3-5.0","> 43.87", "> 18.85", "> 16.2%",  "> 3.8%",   "> 8 SMLMV", "≤ 10%", "≤ 4",  "≥ +20%"),
+        (1, "0-1.3",  "≤ 9.89",  "≤ 7.93",  "≤ 0%",    "≤ 0%",    "≤ 2 SMLMV", "> 50%", "> 32", "< -60%"),
+        (2, "1.3-2.3","≤ 19.08", "≤ 9.78",  "≤ 4%",    "≤ 4%",    "≤ 3 SMLMV", "≤ 50%", "≤ 32", "< -40%"),
+        (3, "2.3-3.3","≤ 29.90", "≤ 12.76", "≤ 18%",   "≤ 18%",   "≤ 5 SMLMV", "≤ 30%", "≤ 18", "< -15%"),
+        (4, "3.3-4.3","≤ 43.87", "≤ 18.85", "≤ 30%",   "≤ 30%",   "≤ 8 SMLMV", "≤ 20%", "≤ 10", "< +20%"),
+        (5, "4.3-5.0","> 43.87", "> 18.85", "> 30%",   "> 30%",   "> 8 SMLMV", "≤ 10%", "≤ 4",  "≥ +20%"),
     ]
     ETIQUETAS = {
         1: "1 — Bajo", 2: "2 — Bajo-Medio", 3: "3 — Medio",
@@ -2699,12 +3555,12 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
     fila += 1
     ws.merge_cells(f"A{fila}:N{fila}")
     _cell(ws, fila, 1,
-          "(*) Los valores de AAGR corresponden a la banda ESTABLECIDO (400–1.499 est. en año inicial). "
-          "El sistema usa umbrales distintos por nivel (ESP / MAE) y por banda de tamaño: "
-          "NICHO (30–99 est.) / EMERGENTE (100–399) / ESTABLECIDO (400–1.499) / CONSOLIDADO (≥ 1.500). "
-          "Cada categoría compite en el pool de percentiles AAGR solo contra mercados de tamaño similar. "
+          "(*) El sistema de crecimiento mantiene el árbol de clasificación por tipo de mercado "
+          "(NICHO / EMERGENTE / ESTABLECIDO / CONSOLIDADO / BASE_PEQUEÑA / CATEGORÍA_NUEVA / "
+          "EXTINTA / SIN_ACTIVIDAD) y la elección automática entre AAGR y CAGR según el tamaño "
+          "de la base histórica. Los umbrales de score AAGR son fijos e iguales para todos los "
+          "niveles y tipos: ≤ 0% → 1 · ≤ 4% → 2 · ≤ 18% → 3 · ≤ 30% → 4 · > 30% → 5. "
           "EXTINTA y SIN_ACTIVIDAD reciben score AAGR = 1 directamente. "
-          "CATEGORIA_NUEVA usa los thresholds de BASE_PEQUEÑA. "
           "La participación usa quintiles dinámicos del segmento actual.",
           bg="FFF8E1", fg="5D4037", halign="left", wrap=True, size=9)
     ws.row_dimensions[fila].height = 40
@@ -2797,6 +3653,126 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
         f"(7) PC_{_yr_ini} > 0 y PC_{_yr_fin} = 0 → EXTINTA → AAGR = −1.0 fijo. "
         f"(8) Ambos = 0 → SIN_ACTIVIDAD → NaN → Score AAGR = 1.",
         bg="F1F8E9", fg="1B5E20", halign="left", wrap=True, size=9,
+    )
+    ws.row_dimensions[fila].height = 62
+
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(
+        ws,
+        fila,
+        1,
+        "TIPO DE MERCADO INDIVIDUAL — Umbrales para programas académicos individuales",
+        bold=True,
+        bg="2E7D32",
+        fg=BLANCO,
+        size=10,
+    )
+    ws.row_dimensions[fila].height = 20
+    fila += 1
+
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(
+        ws,
+        fila,
+        1,
+        "La columna TIPO_MERCADO_INDIVIDUAL en el archivo Base_Programas clasifica cada "
+        "programa académico individualmente usando el mismo árbol de decisión que las "
+        "categorías, pero con umbrales calibrados para el volumen de un solo programa "
+        "(no la suma nacional). Los umbrales se calcularon con los percentiles P20/P40/P60/P80 "
+        "de la distribución real de primer_curso de 22.771 programas (2014–2024). "
+        "pc_inicio = primer año con dato > 0 en el período 2014–2024. "
+        f"pc_fin = primer_curso del año más reciente disponible ({_yr_fin}).",
+        bg="E3F2FD",
+        fg="0D47A1",
+        halign="left",
+        wrap=True,
+        size=9,
+    )
+    ws.row_dimensions[fila].height = 48
+    fila += 1
+
+    for ci, h in enumerate(["Tipo de mercado", "Significado"], 1):
+        _cell(ws, fila, ci, h, bold=True, bg="388E3C", fg=BLANCO, size=9)
+    ws.row_dimensions[fila].height = 18
+    fila += 1
+
+    TIPO_BG_INDIV = {
+        "BASE_PEQUENA": "FFF8E1",
+        "NICHO": "E8F5E9",
+        "EMERGENTE": "E3F2FD",
+        "ESTABLECIDO": "EDE7F6",
+        "CONSOLIDADO": "FCE4EC",
+        "CATEGORIA_NUEVA": "E1F5FE",
+        "EXTINTA": "FFEBEE",
+        "SIN_ACTIVIDAD": "F5F5F5",
+    }
+    TIPOS_MERCADO_INDIV = [
+        (
+            "BASE_PEQUENA",
+            "pc_inicio < 5 (ESP) / < 8 (MAE) / < 22 (PRE). El programa existe pero con "
+            "demanda muy baja para su nivel.",
+        ),
+        (
+            "NICHO",
+            "5 ≤ pc_inicio < 12 (ESP) / 8 ≤ pc_inicio < 12 (MAE) / 22 ≤ pc_inicio < 45 (PRE). "
+            "Programa con demanda pequeña pero establecida.",
+        ),
+        (
+            "EMERGENTE",
+            "12 ≤ pc_inicio < 21 (ESP) / 12 ≤ pc_inicio < 18 (MAE) / 45 ≤ pc_inicio < 76 (PRE). "
+            "Demanda media para su nivel de formación.",
+        ),
+        (
+            "ESTABLECIDO",
+            "21 ≤ pc_inicio < 37 (ESP) / 18 ≤ pc_inicio < 30 (MAE) / 76 ≤ pc_inicio < 136 (PRE). "
+            "Programa con demanda sólida y consolidada.",
+        ),
+        (
+            "CONSOLIDADO",
+            "pc_inicio ≥ 37 (ESP) / ≥ 30 (MAE) / ≥ 136 (PRE). Programa con alta demanda. "
+            "Percentil 80+ dentro de su nivel.",
+        ),
+        (
+            "CATEGORIA_NUEVA",
+            f"pc_inicio = 0 pero pc_fin > 0. El programa no tenía estudiantes en ningún año "
+            f"histórico pero sí en {_yr_fin}.",
+        ),
+        (
+            "EXTINTA",
+            f"pc_inicio > 0 pero pc_fin = 0. El programa tuvo estudiantes en algún momento "
+            f"pero ya no los tiene en {_yr_fin}.",
+        ),
+        (
+            "SIN_ACTIVIDAD",
+            "pc_inicio = 0 y pc_fin = 0. Sin primer_curso en ningún año del período 2014–2024.",
+        ),
+    ]
+    for tipo, desc in TIPOS_MERCADO_INDIV:
+        bg = TIPO_BG_INDIV.get(tipo, "FFFFFF")
+        _cell(ws, fila, 1, tipo, bold=True, bg=bg, halign="left")
+        _cell(ws, fila, 2, desc, bg=bg, halign="left", wrap=True)
+        ws.row_dimensions[fila].height = 36
+        fila += 1
+
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(
+        ws,
+        fila,
+        1,
+        "¿Por qué difieren los umbrales de categorías e individuales? Las categorías agregan "
+        "todos los programas de una disciplina en Colombia (ej. Administración de Empresas suma "
+        "decenas de programas → 4.145 estudiantes en 2019). Un programa individual de esa misma "
+        "categoría puede tener 15–50 estudiantes propios. Con los umbrales de categoría (≥30 ESP "
+        "para NICHO), el 80% de los programas individuales quedarían en BASE_PEQUEÑA, perdiendo "
+        "toda capacidad discriminante. Los umbrales individuales (P20/P40/P60/P80 reales) "
+        "garantizan que cada banda capture ~20% del universo de programas activos por nivel.",
+        bg="F1F8E9",
+        fg="1B5E20",
+        halign="left",
+        wrap=True,
+        size=9,
     )
     ws.row_dimensions[fila].height = 62
 
@@ -3000,6 +3976,30 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
         bg="FFF3E0", fg="212121", size=9, halign="left", wrap=True,
     )
     ws.row_dimensions[fila].height = 96
+
+    # ── Paso 4: Proyección de demanda ─────────────────────────────────────────
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(
+        ws, fila, 1,
+        "Paso 4 — Proyección de demanda (2025-2030)",
+        bold=True, bg="455A64", fg="FFFFFF", size=10, halign="left",
+    )
+    ws.row_dimensions[fila].height = 18
+
+    fila += 1
+    ws.merge_cells(f"A{fila}:N{fila}")
+    _cell(
+        ws, fila, 1,
+        "Proyección 2025-2030 por modelo híbrido (lineal o logarítmico, "
+        "según mejor R² sobre 2014-2024). 'Promedio est./año vs 2024' = "
+        "(proyección 2030 − PC real 2024) / 6. 'Tipo de proyección': "
+        "↑↑ EXPANSIÓN (>+50/año) · ↑ CRECIENTE (+10 a +50) · → ESTABLE (−10 a +10) · "
+        "↓ DECRECIENTE (−20 a −10) · ↓↓ CONTRACCIÓN (<−20). "
+        "R² del ajuste indica la fiabilidad estadística del modelo (0-1).",
+        bg="ECEFF1", fg="212121", size=9, halign="left", wrap=True,
+    )
+    ws.row_dimensions[fila].height = 56
 
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 14
@@ -5072,6 +6072,8 @@ def _escribir_hoja_total(
         "AAGR_ROBUSTO": "AAGR primer curso (robusto)",
         "TIPO_CRECIMIENTO": "Tipo de mercado",
         "SEÑAL_TENDENCIA": "Señal tendencia actual",
+        "SEÑAL_TENDENCIA_POST_PANDEMIA": "Señal tendencia (post-pandemia, base 2021)",
+        "AAGR_post_pandemia": f"AAGR post-pandemia (2021-{AÑO_FIN_DATOS})",
         "AAGR_OUTLIER": "⚠ AAGR outlier (base frágil)",
         f"suma_primer_curso_{AÑO_INICIO_HISTORICO}": f"Primer curso {AÑO_INICIO_HISTORICO}",
         f"suma_primer_curso_{AÑO_FIN_DATOS}": f"Primer curso {AÑO_FIN_DATOS}",
@@ -5124,6 +6126,11 @@ def _escribir_hoja_total(
         "score_costo": "S. Costo",
         "calificacion_final": "Calificación final",
     }
+    for _y in range(AÑO_FIN_DATOS + 1, _AÑO_FIN_PROYECCION_FIX26 + 1):
+        NOMBRES_LEGIBLES[f"PROYECCION_PC_{_y}"] = f"Proyección PC {_y}"
+    NOMBRES_LEGIBLES["PENDIENTE_PROYECCION"] = "Promedio est./año vs 2024"
+    NOMBRES_LEGIBLES["R2_PROYECCION"] = "R² del ajuste"
+    NOMBRES_LEGIBLES["TIPO_PROYECCION"] = "Tipo de proyección"
     for _y in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
         NOMBRES_LEGIBLES.setdefault(f"suma_primer_curso_{_y}", f"Primer curso {_y}")
 
@@ -5170,6 +6177,7 @@ def _escribir_hoja_total(
         "COSTO": "6A1B9A",
         "SCORING — valor | puntuación": "000066",
         "CALIFICACIÓN FINAL": "000066",
+        "PROYECCIÓN 2025-2030": "455A64",
     }
     wb = writer.book
     # Posición canónica de la hoja: `total` va en índice 1 (justo después de
@@ -5180,7 +6188,7 @@ def _escribir_hoja_total(
         ws = wb.create_sheet(sheet_name)
     col_order: list[str] = []
     col_idx = 1
-    for block_name, cols in _BLOQUES_TOTAL:
+    for block_name, cols in _bloques_hoja_total(sheet_name):
         present = [c for c in cols if c in ag.columns]
         if not present:
             continue
@@ -5208,7 +6216,7 @@ def _escribir_hoja_total(
         cell_h.alignment = _Al(horizontal="center", vertical="center", wrap_text=True)
     for r_idx, row in enumerate(ag.itertuples(index=False), start=3):
         c_idx = 1
-        for _, cols in _BLOQUES_TOTAL:
+        for _, cols in _bloques_hoja_total(sheet_name):
             for c in cols:
                 if c in ag.columns:
                     val = getattr(row, c, None)
@@ -5331,6 +6339,7 @@ def _aplicar_formato_total(
                 or "suma_matricula" in col_name
                 or "num_programas" in col_name
                 or ("inscritos" in col_name and "suma" in col_name)
+                or (col_name and col_name.startswith("PROYECCION_PC_"))
             ):
                 cell.number_format = "#,##0"
             # Salario SMLMV: 1 decimal (ej. 3.1, 4.5)
@@ -5360,7 +6369,49 @@ def _aplicar_formato_total(
                 cell.number_format = score_fmt
             elif col_name == "calificacion_final":
                 cell.number_format = calif_fmt
-            elif col_name == "SEÑAL_TENDENCIA":
+            elif col_name == "PENDIENTE_PROYECCION":
+                cell.number_format = "0.0"
+            elif col_name == "R2_PROYECCION":
+                cell.number_format = pct_fmt
+            elif col_name == "TIPO_PROYECCION":
+                _TIPO_PROY_FILLS = {
+                    "EXPANSION": PatternFill("solid", fgColor="1F7A3C"),
+                    "CRECIENTE": PatternFill("solid", fgColor="C6EFCE"),
+                    "ESTABLE": PatternFill("solid", fgColor="D6E4F0"),
+                    "DECRECIENTE": PatternFill("solid", fgColor="FFB74D"),
+                    "CONTRACCION": PatternFill("solid", fgColor="C62828"),
+                    "SIN_PROYECCION": PatternFill("solid", fgColor="EEEEEE"),
+                }
+                _TIPO_PROY_FONTS = {
+                    "EXPANSION": {"bold": True, "color": "FFFFFF"},
+                    "CRECIENTE": {"bold": False, "color": "1A5C2A"},
+                    "ESTABLE": {"bold": False, "color": "1A3A5C"},
+                    "DECRECIENTE": {"bold": True, "color": "7D3A00"},
+                    "CONTRACCION": {"bold": True, "color": "FFFFFF"},
+                    "SIN_PROYECCION": {"bold": False, "color": "888888"},
+                }
+                _TIPO_PROY_LABELS = {
+                    "EXPANSION": "↑↑ EXPANSIÓN",
+                    "CRECIENTE": "↑ CRECIENTE",
+                    "ESTABLE": "→ ESTABLE",
+                    "DECRECIENTE": "↓ DECRECIENTE",
+                    "CONTRACCION": "↓↓ CONTRACCIÓN",
+                    "SIN_PROYECCION": "— SIN PROYECCIÓN",
+                }
+                raw_val = str(cell.value).strip().upper() if cell.value is not None else "SIN_PROYECCION"
+                tipo = raw_val if raw_val in _TIPO_PROY_FILLS else "SIN_PROYECCION"
+                cell.value = _TIPO_PROY_LABELS.get(tipo, tipo)
+                cell.fill = _TIPO_PROY_FILLS[tipo]
+                fnt = _TIPO_PROY_FONTS[tipo]
+                from openpyxl.styles import Font as _FontTipo
+                cell.font = _FontTipo(
+                    bold=fnt["bold"],
+                    color=fnt["color"],
+                    name="Arial",
+                    size=10,
+                )
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif col_name in ("SEÑAL_TENDENCIA", "SEÑAL_TENDENCIA_POST_PANDEMIA"):
                 raw_val = str(cell.value).strip() if cell.value is not None else "SIN_DATO"
                 senal = raw_val if raw_val in SENAL_FILLS else "SIN_DATO"
                 cell.value = SENAL_LABELS.get(senal, senal)
@@ -5453,6 +6504,13 @@ def _aplicar_formato_total(
         "AAGR_ROBUSTO": 18,
         "TIPO_CRECIMIENTO": 18,
         "SEÑAL_TENDENCIA": 22,
+        "SEÑAL_TENDENCIA_POST_PANDEMIA": 28,
+        "AAGR_post_pandemia": 22,
+        **{f"PROYECCION_PC_{y}": 16
+           for y in range(AÑO_FIN_DATOS + 1, _AÑO_FIN_PROYECCION_FIX26 + 1)},
+        "PENDIENTE_PROYECCION": 22,
+        "R2_PROYECCION": 14,
+        "TIPO_PROYECCION": 22,
         f"inscritos_{AÑO_FIN_DATOS - 1}_suma": 16,
         f"inscritos_{AÑO_FIN_DATOS}_suma": 16,
         f"inscritos_{AÑO_FIN_DATOS - 1}_prom_por_programa": 18,
@@ -5495,7 +6553,108 @@ def _aplicar_formato_total(
     ws.auto_filter.ref = ws.dimensions
 
 
-def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
+_UMBRALES_INDIV = {
+    # ESP: P20=5, P40=12, P60=21, P80=37  (n=3,164 programas activos)
+    "ESP": {"base": 5, "nicho": 12, "emergente": 21, "establecido": 37},
+    # MAE: P20=8, P40=12, P60=18, P80=30  (n=1,855 programas activos)
+    "MAE": {"base": 8, "nicho": 12, "emergente": 18, "establecido": 30},
+    # PRE: P20=22, P40=45, P60=76, P80=136 (n=4,331 programas activos)
+    "PRE": {"base": 22, "nicho": 45, "emergente": 76, "establecido": 136},
+}
+
+COLORES_TIPO_MERCADO = {
+    "BASE_PEQUENA": "FFF8E1",
+    "NICHO": "E8F5E9",
+    "EMERGENTE": "E3F2FD",
+    "ESTABLECIDO": "EDE7F6",
+    "CONSOLIDADO": "FCE4EC",
+    "CATEGORIA_NUEVA": "E1F5FE",
+    "EXTINTA": "FFEBEE",
+    "SIN_ACTIVIDAD": "F5F5F5",
+}
+
+
+def _calcular_tipo_mercado_individual(df: pd.DataFrame) -> pd.Series:
+    """
+    Clasifica cada programa individualmente con el mismo árbol de decisión
+    que TIPO_CRECIMIENTO, pero con umbrales calibrados para programa individual
+    (no para categorías agregadas).
+
+    Usa el primer año con dato > 0 como 'pc_inicio' y AÑO_FIN_DATOS como 'pc_fin'.
+    Requiere columnas PRIMER_CURSO_2014..PRIMER_CURSO_{AÑO_FIN_DATOS} y
+    NIVEL_DE_FORMACIÓN en el DataFrame.
+
+    Retorna pd.Series con los valores del árbol de decisión.
+    """
+
+    def _grupo_nivel(niv: object) -> str:
+        n = str(niv).upper().strip()
+        if "UNIVERSITARIO" in n:
+            return "PRE"
+        if "MAESTR" in n:
+            return "MAE"
+        return "ESP"
+
+    def _banda_individual(pc: float, grupo: str) -> str:
+        u = _UMBRALES_INDIV[grupo]
+        if pc < u["base"]:
+            return "BASE_PEQUENA"
+        if pc < u["nicho"]:
+            return "NICHO"
+        if pc < u["emergente"]:
+            return "EMERGENTE"
+        if pc < u["establecido"]:
+            return "ESTABLECIDO"
+        return "CONSOLIDADO"
+
+    cols_pc = sorted(
+        [
+            c
+            for c in df.columns
+            if c.startswith("PRIMER_CURSO_") and c.replace("PRIMER_CURSO_", "").isdigit()
+        ],
+        key=lambda c: int(c.replace("PRIMER_CURSO_", "")),
+    )
+
+    if not cols_pc:
+        log_warning(
+            "[Exportar F1] No hay columnas PRIMER_CURSO_* — TIPO_MERCADO_INDIVIDUAL = SIN_ACTIVIDAD"
+        )
+        return pd.Series("SIN_ACTIVIDAD", index=df.index, dtype=object)
+
+    col_fin = cols_pc[-1]
+    pc_fin = pd.to_numeric(df[col_fin], errors="coerce").fillna(0)
+
+    pc_mat = df[cols_pc].apply(pd.to_numeric, errors="coerce").fillna(0)
+    pc_inicio = pc_mat.apply(
+        lambda row: next((row[c] for c in cols_pc if row[c] > 0), 0.0),
+        axis=1,
+    )
+
+    nivel_serie = df.get("NIVEL_DE_FORMACIÓN", pd.Series("", index=df.index))
+
+    resultado = pd.Series("SIN_ACTIVIDAD", index=df.index, dtype=object)
+    for idx in df.index:
+        p0 = float(pc_inicio[idx])
+        pf = float(pc_fin[idx])
+        grupo = _grupo_nivel(nivel_serie[idx])
+
+        if p0 == 0 and pf == 0:
+            resultado[idx] = "SIN_ACTIVIDAD"
+        elif p0 > 0 and pf == 0:
+            resultado[idx] = "EXTINTA"
+        elif p0 == 0 and pf > 0:
+            resultado[idx] = "CATEGORIA_NUEVA"
+        else:
+            resultado[idx] = _banda_individual(p0, grupo)
+
+    return resultado
+
+
+def exportar_base_maestra_excel(
+    ruta_salida: Path | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> Path:
     """
     Exporta un Excel formateado con los resultados de la Fase 1 (base_maestra.parquet).
 
@@ -5551,15 +6710,37 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
         "ESTADO_PROGRAMA",
         # Resultado de la clasificación
         "CATEGORIA_FINAL",
+        "TIPO_MERCADO_INDIVIDUAL",
         "FUENTE_CATEGORIA",
         "PROBABILIDAD",
         "CATEGORIA_ALTERNATIVA",
         "PROBABILIDAD_ALTERNATIVA",
         "REQUIERE_REVISION",
     ]
+
+    df["TIPO_MERCADO_INDIVIDUAL"] = _calcular_tipo_mercado_individual(df)
+    log_info(
+        "[Exportar F1] TIPO_MERCADO_INDIVIDUAL — "
+        + ", ".join(
+            f"{t}={int((df['TIPO_MERCADO_INDIVIDUAL'] == t).sum())}"
+            for t in [
+                "CONSOLIDADO",
+                "ESTABLECIDO",
+                "EMERGENTE",
+                "NICHO",
+                "BASE_PEQUENA",
+                "CATEGORIA_NUEVA",
+                "EXTINTA",
+                "SIN_ACTIVIDAD",
+            ]
+            if (df["TIPO_MERCADO_INDIVIDUAL"] == t).any()
+        )
+    )
+
     cols_export = [c for c in COLS_ORDEN if c in df.columns]
     # Agregar columnas que no están en la lista pero sí en el df (al final)
     extra = [c for c in df.columns if c not in cols_export and not c.startswith("_")]
+
     df_export = df[cols_export + extra].copy()
 
     # Limpiar columnas internas
@@ -5647,6 +6828,7 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
             "NÚCLEO_BÁSICO_DEL_CONOCIMIENTO": 28,
             "ESTADO_PROGRAMA": 14,
             "CATEGORIA_FINAL": 32,
+            "TIPO_MERCADO_INDIVIDUAL": 24,
             "FUENTE_CATEGORIA": 18,
             "PROBABILIDAD": 14,
             "CATEGORIA_ALTERNATIVA": 32,
@@ -5718,6 +6900,17 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
         ws.freeze_panes = "A3"
         ws.auto_filter.ref = f"A2:{get_column_letter(len(df_h.columns))}2"
 
+    def _colorear_tipo_mercado_individual(ws, df_h: pd.DataFrame, fila_inicio: int = 3) -> None:
+        """Aplica color de fondo a la columna TIPO_MERCADO_INDIVIDUAL (solo visual)."""
+        if "TIPO_MERCADO_INDIVIDUAL" not in df_h.columns:
+            return
+        col_idx = list(df_h.columns).index("TIPO_MERCADO_INDIVIDUAL") + 1
+        for row_offset, tipo_val in enumerate(df_h["TIPO_MERCADO_INDIVIDUAL"]):
+            color = COLORES_TIPO_MERCADO.get(str(tipo_val), "FFFFFF")
+            ws.cell(row=fila_inicio + row_offset, column=col_idx).fill = PatternFill(
+                start_color=color, end_color=color, fill_type="solid"
+            )
+
     # ── Escribir Excel con openpyxl puro (sin ExcelWriter para evitar corrupción) ──
     import openpyxl as _opxl
 
@@ -5731,6 +6924,11 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
         df_export,
         f"Programas Esp+Maestría con Categorías de Mercado — {len(df_export):,} programas",
     )
+    if on_progress:
+        on_progress("Hoja principal escrita. Aplicando colores...")
+    _colorear_tipo_mercado_individual(ws_main, df_export)
+    if on_progress:
+        on_progress("Colores aplicados. Guardando archivo...")
 
     # Hoja revisión requerida
     if len(df_revision) > 0:
@@ -5888,6 +7086,8 @@ def exportar_base_maestra_excel(ruta_salida: Path | None = None) -> Path:
     ws_ley.column_dimensions["C"].width = 80
 
     wb.save(str(ruta_salida))
+    if on_progress:
+        on_progress("Archivo guardado.")
 
     n_verdes = (
         int(df_export["FUENTE_CATEGORIA"].astype(str).str.upper().isin(["CRUCE_SNIES", "MATCH_NOMBRE", "MATCH_CATEGORIA"]).sum())
