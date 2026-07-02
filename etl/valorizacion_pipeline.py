@@ -918,7 +918,7 @@ def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
     Construye tabla de crecimiento de mercado con 6 segmentos × ESP/MAE.
 
     Columnas: NIVEL | 2014-2024 | CAGR 2014-24 | CAGR 2019-24 | CAGR 2021-24.
-    Fuente: archivos primer_curso_YYYY.xlsx en ref/backup/ (no la sábana).
+    Fuente: matriculas_primercurso_ESTANDARIZADO.xlsx (consolidado en ref/backup/).
     """
     del sabana  # no se usa; datos desde backups SNIES
 
@@ -974,10 +974,6 @@ def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
     col_cagr_2019 = "CAGR 2019-2024"
     col_cagr_2021 = "CAGR 2021-2024"
 
-    def _norm_sheet(name: object) -> str:
-        s2 = _ud.normalize("NFD", str(name))
-        return "".join(ch for ch in s2 if _ud.category(ch) != "Mn").upper()
-
     def _norm_sector(v: object) -> str:
         u = str(v).upper().strip()
         if u in ("PRIVADA", "PRIVADO"):
@@ -1012,149 +1008,106 @@ def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
             return "HIBRIDA"
         return "OTROS"
 
-    def _cargar_año(yr: int) -> pd.DataFrame | None:
-        """Carga y normaliza primer_curso_YYYY → SECTOR, MOD, DPTO, NIVEL, PC."""
-        candidatos = [
-            REF_DIR / "backup" / "matriculas primer curso" / f"primer_curso_{yr}.xlsx",
-            REF_DIR / "backup" / f"primer_curso_{yr}.xlsx",
-            RAW_HISTORIC_DIR / f"primer_curso_{yr}.xlsx",
-            REF_DIR / f"primer_curso_{yr}.xlsx",
-        ]
-        ruta = next((p for p in candidatos if p.exists()), None)
-        if ruta is None:
-            log_warning(f"[Crecimiento] {yr}: archivo no encontrado.")
-            return None
+    from etl.mercado_pipeline import (
+        _hoja_primer_curso_snies,
+        _indices_columnas_consolidado,
+        ruta_consolidado_primer_curso,
+    )
 
+    _ruta_cons = ruta_consolidado_primer_curso(REF_DIR)
+    _datos_consolidado_crec: dict[int, pd.DataFrame | None] = {}
+
+    if not _ruta_cons.exists():
+        log_warning(
+            "[Crecimiento] No se encontró matriculas_primercurso_ESTANDARIZADO.xlsx."
+        )
+    else:
         try:
             import openpyxl
 
-            wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+            acum: dict[int, list[dict[str, object]]] = {}
+            wb = openpyxl.load_workbook(_ruta_cons, read_only=True, data_only=True)
             try:
-                hoja = next(
-                    (s for s in wb.sheetnames if "INDICE" not in _norm_sheet(s)),
-                    wb.sheetnames[-1],
-                )
+                ws = wb[_hoja_primer_curso_snies(wb)]
+                row_iter = ws.iter_rows(min_row=1, values_only=True)
+                header = next(row_iter, None)
+                if not header:
+                    raise ValueError("archivo consolidado sin encabezado")
+
+                cols = _indices_columnas_consolidado(header)
+                idx_ano = cols["ano"]
+                idx_pc = cols["pc"]
+                idx_nivel = cols["nivel"]
+                idx_sector = cols["sector"]
+                idx_modalidad = cols["modalidad"]
+                idx_dpto = cols["dpto"]
+
+                if any(x is None for x in (idx_ano, idx_pc, idx_nivel)):
+                    log_warning(
+                        "[Crecimiento] Consolidado: columnas AÑO/NIVEL/PRIMER CURSO no encontradas."
+                    )
+                else:
+                    idx_list = [idx_ano, idx_pc, idx_nivel]
+                    for opt in (idx_sector, idx_modalidad, idx_dpto):
+                        if opt is not None:
+                            idx_list.append(opt)
+                    max_idx = max(idx_list)
+
+                    for row in row_iter:
+                        if not row or len(row) <= max_idx:
+                            continue
+                        try:
+                            ano = int(row[idx_ano])
+                        except (TypeError, ValueError):
+                            continue
+                        nivel = str(row[idx_nivel] or "").strip().upper()
+                        try:
+                            pc = float(row[idx_pc]) if row[idx_pc] is not None else 0.0
+                        except (TypeError, ValueError):
+                            pc = 0.0
+                        sector = (
+                            _norm_sector(row[idx_sector])
+                            if idx_sector is not None and row[idx_sector] is not None
+                            else "DESCONOCIDO"
+                        )
+                        mod = (
+                            _norm_modalidad(row[idx_modalidad])
+                            if idx_modalidad is not None and row[idx_modalidad] is not None
+                            else "PRESENCIAL"
+                        )
+                        dpto = (
+                            _norm_dpto(row[idx_dpto])
+                            if idx_dpto is not None and row[idx_dpto] is not None
+                            else ""
+                        )
+                        acum.setdefault(ano, []).append(
+                            {
+                                "NIVEL": nivel,
+                                "PC": pc,
+                                "SECTOR": sector,
+                                "MOD": mod,
+                                "DPTO": dpto,
+                            }
+                        )
             finally:
                 wb.close()
 
-            df_raw: pd.DataFrame | None = None
-            for hdr in range(5, 13):
-                try:
-                    cand = pd.read_excel(ruta, sheet_name=hoja, header=hdr, dtype=str)
-                except Exception:
-                    continue
-                cols_up = {str(c).upper().strip(): c for c in cand.columns}
-                tiene_nivel = any("NIVEL" in k and "FORMAC" in k for k in cols_up)
-                tiene_pc = any("PRIMER" in k for k in cols_up)
-                if tiene_nivel and tiene_pc:
-                    df_raw = cand
-                    break
+            for ano, filas in acum.items():
+                out = pd.DataFrame(filas)
+                mask = out["NIVEL"].str.contains("ESPECIALI|MAESTR", na=False)
+                _datos_consolidado_crec[ano] = out[mask].copy()
 
-            if df_raw is None:
-                preview = pd.read_excel(ruta, sheet_name=hoja, header=None, nrows=40)
-                header_idx: int | None = None
-                for idx in range(len(preview)):
-                    vals = [
-                        str(v).strip()
-                        for v in preview.iloc[idx].tolist()
-                        if pd.notna(v) and str(v).strip()
-                    ]
-                    if not vals or len(vals) < 5:
-                        continue
-                    first_n = _ud.normalize("NFD", vals[0])
-                    first_n = "".join(
-                        ch for ch in first_n if _ud.category(ch) != "Mn"
-                    ).upper()
-                    vals_n = [
-                        "".join(
-                            ch for ch in _ud.normalize("NFD", v)
-                            if _ud.category(ch) != "Mn"
-                        ).upper()
-                        for v in vals
-                    ]
-                    if "CODIGO" in first_n and (
-                        any("SNIES" in v for v in vals_n) or "INSTITUC" in first_n
-                    ):
-                        header_idx = idx
-                        break
-                if header_idx is not None:
-                    cand = pd.read_excel(
-                        ruta, sheet_name=hoja, header=header_idx, dtype=str
-                    )
-                    cols_up = {str(c).upper().strip(): c for c in cand.columns}
-                    if any("NIVEL" in k and "FORMAC" in k for k in cols_up) and any(
-                        "PRIMER" in k for k in cols_up
-                    ):
-                        df_raw = cand
-
-            if df_raw is None:
-                log_warning(f"[Crecimiento] {yr}: no se detectó encabezado válido.")
-                return None
-
-            cols_up = {str(c).upper().strip(): c for c in df_raw.columns}
-
-            col_niv = next(
-                (
-                    orig
-                    for key, orig in cols_up.items()
-                    if "NIVEL" in key and "FORMAC" in key and not key.startswith("ID")
-                ),
-                None,
-            )
-            col_pc = next((orig for key, orig in cols_up.items() if "PRIMER" in key), None)
-            col_sec = next(
-                (
-                    orig
-                    for key, orig in cols_up.items()
-                    if "SECTOR" in key and "IES" in key and not key.startswith("ID")
-                ),
-                None,
-            )
-            col_mod = next(
-                (
-                    orig
-                    for key, orig in cols_up.items()
-                    if key in ("METODOLOGÍA", "MODALIDAD", "METODOLOGIA")
-                    and not key.startswith("ID")
-                ),
-                None,
-            )
-            if col_mod is None:
-                col_mod = next(
-                    (
-                        orig
-                        for key, orig in cols_up.items()
-                        if "METODOL" in key and not key.startswith("ID")
-                    ),
-                    None,
+            if _datos_consolidado_crec:
+                log_info(
+                    f"[Crecimiento] Consolidado leído en una pasada: "
+                    f"{len(_datos_consolidado_crec)} años."
                 )
-            col_dpto = next(
-                (orig for key, orig in cols_up.items() if "DEPARTAMENTO" in key and "OFERTA" in key),
-                None,
-            )
-
-            if not col_niv or not col_pc:
-                log_warning(f"[Crecimiento] {yr}: columnas nivel/pc no encontradas.")
-                return None
-
-            out = pd.DataFrame()
-            out["NIVEL"] = df_raw[col_niv].astype(str).str.strip().str.upper()
-            out["PC"] = pd.to_numeric(df_raw[col_pc], errors="coerce").fillna(0)
-            out["SECTOR"] = (
-                df_raw[col_sec].apply(_norm_sector) if col_sec else "DESCONOCIDO"
-            )
-            out["MOD"] = (
-                df_raw[col_mod].apply(_norm_modalidad) if col_mod else "PRESENCIAL"
-            )
-            out["DPTO"] = (
-                df_raw[col_dpto].apply(_norm_dpto) if col_dpto else ""
-            )
-            mask = out["NIVEL"].str.contains("ESPECIALI|MAESTR", na=False)
-            return out[mask].copy()
-
         except Exception as e:
-            log_warning(f"[Crecimiento] {yr}: error al leer — {e}")
-            return None
+            log_warning(f"[Crecimiento] Error leyendo consolidado — {e}")
+
+    def _cargar_año(yr: int) -> pd.DataFrame | None:
+        """Retorna datos pre-cargados del consolidado para el año solicitado."""
+        return _datos_consolidado_crec.get(yr)
 
     datos: dict[int, pd.DataFrame | None] = {}
     for yr in años:
@@ -1256,128 +1209,82 @@ def _construir_hoja_proyecciones(
 
     log("  [Proyecciones] Cargando series históricas primer_curso...")
 
-    def _keys_sin_acento(keys: list[str]) -> dict[str, str]:
-        return {
-            k: "".join(
-                c for c in _ud.normalize("NFD", k) if _ud.category(c) != "Mn"
-            )
-            for k in keys
-        }
+    from etl.mercado_pipeline import (
+        _hoja_primer_curso_snies,
+        _indices_columnas_consolidado,
+        ruta_consolidado_primer_curso,
+    )
 
-    def _detectar_cols_programa(columns: list[str]) -> tuple[str | None, str | None, str | None]:
-        """IES, programa académico, primer curso — desde nombres de columna SNIES."""
-        keys = [str(c).upper().replace("\n", " ").strip() for c in columns]
-        kn = _keys_sin_acento(keys)
+    _ruta_cons = ruta_consolidado_primer_curso(REF_DIR)
+    if not _ruta_cons.exists():
+        log_warning(
+            "  [Proyecciones] No se encontró matriculas_primercurso_ESTANDARIZADO.xlsx. "
+            "Hoja vacía."
+        )
+        return pd.DataFrame()
 
-        col_ies = next(
-            (
-                keys[i]
-                for i, k in enumerate(keys)
-                if "INSTITUC" in kn[k]
-                and "IES" in kn[k]
-                and "PADRE" not in kn[k]
-                and not k.startswith("ID")
-            ),
-            None,
-        )
-        col_prog = next(
-            (
-                keys[i]
-                for i, k in enumerate(keys)
-                if "PROGRAMA" in kn[k]
-                and "ACAD" in kn[k]
-                and "CODIGO" not in kn[k]
-                and "ACRED" not in kn[k]
-                and not k.startswith("ID")
-            ),
-            None,
-        )
-        if col_prog is None:
-            col_prog = next(
-                (
-                    keys[i]
-                    for i, k in enumerate(keys)
-                    if "PROGRAMA" in kn[k]
-                    and "CODIGO" not in kn[k]
-                    and "ACRED" not in kn[k]
-                    and not k.startswith("ID")
-                ),
-                None,
-            )
-        col_pc = next(
-            (keys[i] for i, k in enumerate(keys) if "PRIMER" in kn[k]),
-            None,
-        )
-        return col_ies, col_prog, col_pc
+    registros: list[dict[str, object]] = []
+    try:
+        import openpyxl
 
-    filas_hist: list[pd.DataFrame] = []
-    for yr in AÑOS_DATOS:
-        candidatos = [
-            REF_DIR / "backup" / "matriculas primer curso" / f"primer_curso_{yr}.xlsx",
-            REF_DIR / "backup" / f"primer_curso_{yr}.xlsx",
-            RAW_HISTORIC_DIR / f"primer_curso_{yr}.xlsx",
-            REF_DIR / f"primer_curso_{yr}.xlsx",
-        ]
-        ruta = next((p for p in candidatos if p.exists()), None)
-        if ruta is None:
-            continue
+        wb = openpyxl.load_workbook(_ruta_cons, read_only=True, data_only=True)
         try:
-            import openpyxl as _opxl
+            ws = wb[_hoja_primer_curso_snies(wb)]
+            row_iter = ws.iter_rows(min_row=1, values_only=True)
+            header = next(row_iter, None)
+            if not header:
+                raise ValueError("archivo consolidado sin encabezado")
 
-            _wb = _opxl.load_workbook(ruta, read_only=True, data_only=True)
-            _hoja = next(
-                (s for s in _wb.sheetnames if "NDICE" not in s.upper()),
-                _wb.sheetnames[-1],
-            )
-            _wb.close()
+            cols = _indices_columnas_consolidado(header)
+            idx_ano = cols["ano"]
+            idx_pc = cols["pc"]
+            idx_ies = cols["ies"]
+            idx_prog = cols["prog"]
 
-            _df_raw: pd.DataFrame | None = None
-            _hdr_ok: int | None = None
-            for hdr in range(5, 13):
-                try:
-                    _cand = pd.read_excel(
-                        ruta, sheet_name=_hoja, header=hdr, dtype=str, nrows=5
-                    )
-                    _col_ies, _col_prog, _col_pc = _detectar_cols_programa(
-                        list(_cand.columns)
-                    )
-                    if all([_col_ies, _col_prog, _col_pc]):
-                        _hdr_ok = hdr
-                        break
-                except Exception:
+            if any(x is None for x in (idx_ano, idx_pc, idx_ies, idx_prog)):
+                raise ValueError(
+                    "columnas IES/PROGRAMA/AÑO/PRIMER CURSO no encontradas en consolidado"
+                )
+
+            max_idx = max(idx_ano, idx_pc, idx_ies, idx_prog)
+            for row in row_iter:
+                if not row or len(row) <= max_idx:
                     continue
+                try:
+                    ano = int(row[idx_ano])
+                except (TypeError, ValueError):
+                    continue
+                if ano not in AÑOS_DATOS:
+                    continue
+                try:
+                    pc = float(row[idx_pc]) if row[idx_pc] is not None else 0.0
+                except (TypeError, ValueError):
+                    pc = 0.0
+                ies = _n(row[idx_ies])
+                prog = _n(row[idx_prog])
+                if not ies or not prog:
+                    continue
+                registros.append({"_IES": ies, "_PROG": prog, "_AÑO": ano, "_PC": pc})
+        finally:
+            wb.close()
+    except Exception as e:
+        log_warning(f"  [Proyecciones] Error leyendo consolidado — {e}")
+        return pd.DataFrame()
 
-            if _hdr_ok is None:
-                continue
-
-            _df_raw = pd.read_excel(
-                ruta, sheet_name=_hoja, header=_hdr_ok, dtype=str
-            )
-            _col_ies, _col_prog, _col_pc = _detectar_cols_programa(list(_df_raw.columns))
-            if not all([_col_ies, _col_prog, _col_pc]):
-                continue
-
-            _df_raw["_PC"] = pd.to_numeric(_df_raw[_col_pc], errors="coerce").fillna(0)
-            _df_raw["_IES"] = _df_raw[_col_ies].apply(_n)
-            _df_raw["_PROG"] = _df_raw[_col_prog].apply(_n)
-            _df_raw["_AÑO"] = yr
-
-            _grp = (
-                _df_raw.groupby(["_IES", "_PROG", "_AÑO"])["_PC"]
-                .sum()
-                .reset_index()
-            )
-            filas_hist.append(_grp)
-        except Exception as e:
-            log_warning(f"  [Proyecciones] {yr}: lectura auxiliar fallida — {e}")
-            continue
-
-    if not filas_hist:
+    if not registros:
         log_warning("  [Proyecciones] No se cargaron datos históricos. Hoja vacía.")
         return pd.DataFrame()
 
-    df_hist = pd.concat(filas_hist, ignore_index=True)
+    df_hist = (
+        pd.DataFrame(registros)
+        .groupby(["_IES", "_PROG", "_AÑO"], as_index=False)["_PC"]
+        .sum()
+    )
     df_hist.columns = ["IES", "PROGRAMA", "AÑO", "PC"]
+    log(
+        f"  [Proyecciones] Consolidado leído en una pasada: "
+        f"{len(df_hist):,} filas IES×programa×año."
+    )
 
     pv = (
         df_hist.groupby(["IES", "PROGRAMA", "AÑO"])["PC"]

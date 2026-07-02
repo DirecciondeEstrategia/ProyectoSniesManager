@@ -54,87 +54,31 @@ _SCORE_MAT_PRE_P40: float = 65.0
 _SCORE_MAT_PRE_P60: float = 100.0
 _SCORE_MAT_PRE_P80: float = 160.0
 
-# score_AAGR — thresholds por TIPO_CRECIMIENTO × nivel (Fix 25) ──────────────
+# score_AAGR — umbrales fijos alineados con proceso manual del cliente (Fix 32) ─
 #
-# El valor "NORMAL" de TIPO_CRECIMIENTO fue expandido en 4 bandas de tamaño:
-#   NICHO       : 30–99 est. en año inicial (15–99 MAE)
-#   EMERGENTE   : 100–399
-#   ESTABLECIDO : 400–1.499
-#   CONSOLIDADO : ≥ 1.500
+# El árbol de TIPO_CRECIMIENTO (NICHO / EMERGENTE / ESTABLECIDO / CONSOLIDADO /
+# BASE_PEQUENA / CATEGORIA_NUEVA / EXTINTA / SIN_ACTIVIDAD) y la elección AAGR vs
+# CAGR se mantienen en mercado_pipeline.py. Solo cambia la conversión del
+# AAGR_ROBUSTO resultante a score 1–5: 4 cortes fijos iguales para ESP, MAE y PRE.
 #
-# Cada entrada es (P20, P40, P60, P80) calibrada sobre Colombia 2024.
-# BASE_PEQUENA, CATEGORIA_NUEVA, EXTINTA y SIN_ACTIVIDAD se manejan
-# aparte en _score_aagr_nivel (EXTINTA/SIN_ACTIVIDAD → score 1 directo;
-# CATEGORIA_NUEVA → usa thresholds de BASE_PEQUENA).
+# Umbrales (límite_superior_inclusivo, score):
+#   AAGR ≤  0.0%  → score 1
+#   AAGR ≤  4.0%  → score 2
+#   AAGR ≤ 18.0%  → score 3
+#   AAGR ≤ 30.0%  → score 4
+#   AAGR >  30.0% → score 5
 #
-# Ver comentarios inline sobre calibración por banda.
-_AAGR_ESP_BANDA: dict[str, list[tuple[float, int]]] = {
-    # BASE_PEQUENA n=29 | P20=-3.0%  P40=+5.8%  P60=+10.2%  P80=+13.3%
-    "BASE_PEQUENA": [(-0.030, 1), (0.058, 2), (0.102, 3), (0.133, 4)],
-    # NICHO        n=56 | P20=+3.9%  P40=+10.0% P60=+21.9%  P80=+36.9%
-    # P60/P80 más altos que otros pools porque los nichos tienen
-    # mayor volatilidad porcentual — normal para mercados pequeños.
-    "NICHO":        [(0.039, 1),  (0.100, 2), (0.219, 3), (0.369, 4)],
-    # EMERGENTE    n=68 | P20=+0.7%  P40=+5.5%  P60=+9.9%   P80=+22.4%
-    "EMERGENTE":    [(0.007, 1),  (0.055, 2), (0.099, 3), (0.224, 4)],
-    # ESTABLECIDO  n=44 | P20=+1.5%  P40=+5.9%  P60=+11.7%  P80=+16.2%
-    # Banda de referencia para la tabla estandar_calificacion.
-    "ESTABLECIDO":  [(0.015, 1),  (0.059, 2), (0.117, 3), (0.162, 4)],
-    # CONSOLIDADO  n=19 | P20=-6.9%  P40=+3.1%  P60=+4.7%   P80=+8.3%
-    # Mercados maduros: incluso un AAGR negativo puede ser score 2-3
-    # si es "menos negativo" que el 20% inferior de su banda.
-    "CONSOLIDADO":  [(-0.069, 1), (0.031, 2), (0.047, 3), (0.083, 4)],
-}
-
-_AAGR_MAE_BANDA: dict[str, list[tuple[float, int]]] = {
-    # BASE_PEQUENA n=3  | P20=-24.0% P40=-15.8% P60=-8.7%   P80=-2.8%
-    # n=3 insuficiente para calibración robusta. Se usan los percentiles reales
-    # porque las 3 categorías existentes están todas en contracción severa.
-    # No se hace fallback a NICHO (positivo) porque distorsionaría el score.
-    "BASE_PEQUENA": [(-0.240, 1), (-0.158, 2), (-0.087, 3), (-0.028, 4)],
-    # NICHO        n=16 | P20=+0.8%  P40=+3.7%  P60=+7.8%   P80=+20.1%
-    "NICHO":        [(0.008, 1),  (0.037, 2), (0.078, 3), (0.201, 4)],
-    # EMERGENTE    n=21 | P20=-4.0%  P40=-1.4%  P60=+0.8%   P80=+4.9%
-    "EMERGENTE":    [(-0.040, 1), (-0.014, 2), (0.008, 3), (0.049, 4)],
-    # ESTABLECIDO  n=10 | P20=-15.4% P40=-5.8%  P60=-0.3%   P80=+3.8%
-    "ESTABLECIDO":  [(-0.154, 1), (-0.058, 2), (-0.003, 3), (0.038, 4)],
-    # CONSOLIDADO  n=2  | P20=-0.6%  P40=+3.3%  P60=+7.2%   P80=+11.1%
-    # n=2 insuficiente. Se usan los valores reales de los únicos 2 mercados MAE
-    # consolidados de Colombia. No se hace fallback a ESTABLECIDO porque sus
-    # thresholds (-15%/−6%/0%/4%) son demasiado conservadores para este nivel.
-    "CONSOLIDADO":  [(-0.006, 1), (0.033, 2), (0.072, 3), (0.111, 4)],
-}
-# score_AAGR — PREGRADO, thresholds por banda de tamaño (extensión de Fix 25)
-#
-# TIPO_CRECIMIENTO ya se calcula para UNIVERSITARIO con las mismas 4 bandas que
-# posgrado (NICHO/EMERGENTE/ESTABLECIDO/CONSOLIDADO), pero hasta esta versión
-# scoring.py las ignoraba y usaba un único threshold plano para todas.
-#
-# Auditoría confirmó el mismo sesgo que motivó Fix 25 en posgrado:
-# BASE_PEQUENA sobre-premiado (P80=25.6% vs threshold plano de 12.0% para score 5)
-# y ESTABLECIDO castigado (P80=6.4%, la mitad del mismo threshold).
-#
-# Pregrado no distingue ESP/MAE — un solo diccionario banda → thresholds.
-# NICHO no aparece en pregrado porque el umbral BASE_PEQUEÑA/NORMAL para
-# UNIVERSITARIO es 100 (ver _umbral_base en mercado_pipeline.py), por lo que
-# cualquier categoría con 30-99 estudiantes ya cae en BASE_PEQUEÑA, no en NICHO.
-# Se mantiene la entrada "NICHO" como alias de BASE_PEQUEÑA por robustez,
-# en caso de que el umbral cambie en el futuro y empiecen a aparecer NICHO reales.
-_AAGR_PRE_BANDA: dict[str, list[tuple[float, int]]] = {
-    # BASE_PEQUENA n=24 | P20=0.0%   P40=9.8%  P60=14.0%  P80=25.6%
-    "BASE_PEQUENA": [(0.000, 1), (0.098, 2), (0.140, 3), (0.256, 4)],
-    # NICHO: alias de BASE_PEQUENA — ver nota arriba.
-    "NICHO":        [(0.000, 1), (0.098, 2), (0.140, 3), (0.256, 4)],
-    # EMERGENTE    n=15 | P20=-5.7%  P40=2.3%  P60=7.5%   P80=13.0%
-    "EMERGENTE":    [(-0.057, 1), (0.023, 2), (0.075, 3), (0.130, 4)],
-    # ESTABLECIDO  n=24 | P20=-1.9%  P40=0.2%  P60=0.9%   P80=6.4%
-    "ESTABLECIDO":  [(-0.019, 1), (0.002, 2), (0.009, 3), (0.064, 4)],
-    # CONSOLIDADO  n=53 | P20=0.7%   P40=2.2%  P60=5.0%   P80=8.5%
-    "CONSOLIDADO":  [(0.007, 1), (0.022, 2), (0.050, 3), (0.085, 4)],
-}
+# EXTINTA y SIN_ACTIVIDAD reciben score 1 directamente (sin evaluar AAGR).
+_AAGR_THRESHOLDS_FIJOS: list[tuple[float, int]] = [
+    (0.00, 1),   # ≤ 0%
+    (0.04, 2),   # ≤ 4%
+    (0.18, 3),   # ≤ 18%
+    (0.30, 4),   # ≤ 30%
+    # > 30% → score 5 (manejado por _value_to_score como valor por encima del último umbral)
+]
 
 # Threshold plano anterior — se mantiene solo como referencia histórica.
-# Ya no se usa en SCORING_CONFIG_PREGRADO tras este cambio.
+# Ya no se usa en SCORING_CONFIG_PREGRADO tras Fix 32.
 _AAGR_PRE_THRESHOLDS_LEGACY: list[tuple[float, int]] = [
     (-0.0036, 1), (0.019, 2), (0.064, 3), (0.120, 4)
 ]
@@ -148,10 +92,10 @@ SCORING_CONFIG = [
         "col": "AAGR_ROBUSTO",
         "out": "score_AAGR",
         "peso": 0.20,
-        # Percentiles P20/P40/P60/P80 de AAGR_ROBUSTO (primer_curso) Colombia 288 cats
-        # Thresholds calibrados sobre prom_primer_curso (flujo de nuevos matriculados).
-        # P80 real Colombia = 16.5% para posgrado.
-        "thresholds": [(0.00, 1), (0.038, 2), (0.084, 3), (0.165, 4)],
+        # Fix 32: umbrales fijos alineados con proceso manual cliente.
+        # La función _score_aagr_fijo usa _AAGR_THRESHOLDS_FIJOS directamente.
+        # Este campo es solo referencia documental; no se usa en el cálculo.
+        "thresholds": [(0.00, 1), (0.04, 2), (0.18, 3), (0.30, 4)],
         "inverse": False,
     },
     {
@@ -198,10 +142,9 @@ SCORING_CONFIG_PREGRADO: list[dict] = [
         "col": "AAGR_ROBUSTO",
         "out": "score_AAGR",
         "peso": 0.20,
-        # Fix 25 extendido a pregrado: thresholds por banda, no por este campo.
-        # "thresholds" se mantiene aquí solo como fallback si TIPO_CRECIMIENTO
-        # no está disponible (ver bloque de dispatch más abajo).
-        "thresholds": _AAGR_PRE_THRESHOLDS_LEGACY,
+        # Fix 32: umbrales fijos — _score_aagr_fijo usa _AAGR_THRESHOLDS_FIJOS.
+        # Este campo es solo referencia documental; no se usa en el cálculo.
+        "thresholds": [(0.00, 1), (0.04, 2), (0.18, 3), (0.30, 4)],
         "inverse": False,
     },
     {
@@ -525,66 +468,24 @@ def apply_scoring(
             out[out_col] = 1.0
             continue
 
-        # Árbol de decisión AAGR por banda de tamaño — posgrado (ESP/MAE) y pregrado.
-        # Fix 25 extendido: ambos universos usan TIPO_CRECIMIENTO para elegir el
-        # pool de percentiles correcto, en lugar de un único threshold plano.
-        if (
-            col == "AAGR_ROBUSTO"
-            and universo == "posgrado"
-            and "NIVEL_MAYORIT" in out.columns
-        ):
-            def _score_aagr_nivel(
+        # Fix 32: score AAGR con umbrales fijos (igual para ESP, MAE y pregrado).
+        # El árbol de TIPO_CRECIMIENTO ya eligió AAGR vs CAGR — aquí solo
+        # se convierte el valor resultante a score con los 4 cortes fijos del cliente.
+        if col == "AAGR_ROBUSTO":
+            def _score_aagr_fijo(
                 row,
-                _esp_banda=_AAGR_ESP_BANDA,
-                _mae_banda=_AAGR_MAE_BANDA,
-            ):
-                nivel = str(row.get("NIVEL_MAYORIT", "")).upper()
-                tipo  = str(row.get("TIPO_CRECIMIENTO", "NICHO")).strip()
-                val   = row.get("AAGR_ROBUSTO", np.nan)
-                v = float(val) if pd.notna(val) else np.nan
-
-                if tipo in ("EXTINTA", "SIN_ACTIVIDAD"):
-                    return 1.0
-
-                scoring_tipo = "BASE_PEQUENA" if tipo == "CATEGORIA_NUEVA" else tipo
-
-                if "MAEST" in nivel:
-                    thrs = _mae_banda.get(scoring_tipo, _mae_banda["NICHO"])
-                else:
-                    thrs = _esp_banda.get(scoring_tipo, _esp_banda["NICHO"])
-
-                return _value_to_score(v, thrs, inverse=False)
-
-            out[out_col] = out.apply(_score_aagr_nivel, axis=1)
-
-        elif (
-            col == "AAGR_ROBUSTO"
-            and universo == "pregrado"
-            and "TIPO_CRECIMIENTO" in out.columns
-        ):
-            def _score_aagr_pregrado(
-                row,
-                _pre_banda=_AAGR_PRE_BANDA,
-                _fallback=_AAGR_PRE_THRESHOLDS_LEGACY,
+                _thrs=_AAGR_THRESHOLDS_FIJOS,
             ):
                 tipo = str(row.get("TIPO_CRECIMIENTO", "")).strip()
-                val  = row.get("AAGR_ROBUSTO", np.nan)
+                val = row.get("AAGR_ROBUSTO", np.nan)
                 v = float(val) if pd.notna(val) else np.nan
 
                 if tipo in ("EXTINTA", "SIN_ACTIVIDAD"):
                     return 1.0
 
-                scoring_tipo = "BASE_PEQUENA" if tipo == "CATEGORIA_NUEVA" else tipo
-                thrs = _pre_banda.get(scoring_tipo)
+                return _value_to_score(v, _thrs, inverse=False)
 
-                # Si TIPO_CRECIMIENTO viene vacío o con un valor inesperado,
-                # usar el threshold plano legacy como red de seguridad.
-                if thrs is None:
-                    return _value_to_score(v, _fallback, inverse=False)
-
-                return _value_to_score(v, thrs, inverse=False)
-
-            out[out_col] = out.apply(_score_aagr_pregrado, axis=1)
+            out[out_col] = out.apply(_score_aagr_fijo, axis=1)
 
         else:
             out[out_col] = out[col].apply(
