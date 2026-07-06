@@ -723,6 +723,48 @@ def consolidado_primer_curso_contiene_año(año: int, ruta: Path | None = None) 
         return False
 
 
+def obtener_años_disponibles_consolidado_primer_curso(ruta: Path | None = None) -> set[int]:
+    """
+    Lee matriculas_primercurso_ESTANDARIZADO.xlsx en UNA sola pasada y devuelve
+    el conjunto de años (columna AÑO) presentes en el consolidado.
+
+    A diferencia de consolidado_primer_curso_contiene_año(), que hay que llamar
+    una vez por año consultado (y que en el peor caso — año ausente — escanea
+    el archivo completo sin poder cortar antes), esta función se llama UNA sola
+    vez y el resultado se cachea en memoria por el llamador (ver ConfiguracionDialog
+    en main.py). Evita releer el archivo por cada cambio de año en la GUI.
+    """
+    ruta = ruta or ruta_consolidado_primer_curso()
+    if not ruta.exists():
+        return set()
+    try:
+        import openpyxl
+
+        años: set[int] = set()
+        wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        try:
+            ws = wb[_hoja_primer_curso_snies(wb)]
+            row_iter = ws.iter_rows(min_row=1, values_only=True)
+            header = next(row_iter, None)
+            if not header:
+                return set()
+            idx_ano = _indices_columnas_consolidado(header)["ano"]
+            if idx_ano is None:
+                return set()
+            for row in row_iter:
+                if not row or len(row) <= idx_ano:
+                    continue
+                try:
+                    años.add(int(row[idx_ano]))
+                except (TypeError, ValueError):
+                    continue
+        finally:
+            wb.close()
+        return años
+    except Exception:
+        return set()
+
+
 def actualizar_consolidado_primer_curso(ruta_archivo_crudo: Path, año: int) -> dict:
     """
     Parsea un archivo crudo de SNIES de un año específico (mismo formato variable
@@ -1447,10 +1489,24 @@ def validar_archivos_entrada() -> tuple[bool, list[str]]:
     el formato mínimo esperado. Retorna (ok, lista_de_errores).
     Llamar antes de run_fase2() para dar feedback temprano al usuario.
     """
-    from etl.config import ARCHIVO_PROGRAMAS, ARCHIVO_REFERENTE_CATEGORIAS, REF_DIR
+    from etl.config import ARCHIVO_PROGRAMAS, ARCHIVO_REFERENTE_CATEGORIAS, REF_DIR, get_año_fin_datos_en_disco
 
     errores: list[str] = []
     advertencias: list[str] = []
+
+    # 0. Fix 38: AÑO_FIN_DATOS puede haber quedado desincronizado si el usuario
+    #    cambió el año en 'Configuración del Sistema' sin reiniciar la app
+    #    (from etl.config import AÑO_FIN_DATOS congela el valor al arrancar).
+    #    Si no coincide con lo que hay en config.json, se detiene el pipeline
+    #    en vez de dejarlo correr con el año equivocado sin que nadie lo note.
+    _año_en_disco = get_año_fin_datos_en_disco()
+    if _año_en_disco != AÑO_FIN_DATOS:
+        errores.append(
+            f"AÑO_FIN_DATOS desincronizado: esta sesión tiene cargado el año {AÑO_FIN_DATOS}, "
+            f"pero 'Configuración del Sistema' ahora tiene guardado {_año_en_disco}. "
+            "El cambio de año NO se aplica a los cálculos hasta reiniciar la aplicación. "
+            "Cierra y vuelve a abrir SniesManager, y vuelve a ejecutar el pipeline."
+        )
 
     # 1. Programas.xlsx (Fase 1)
     if not ARCHIVO_PROGRAMAS.exists():
@@ -2256,7 +2312,9 @@ def run_fase3() -> None:
     log_etapa_completada("Fase 3: Consolidación en sábana única", f"{n} filas")
 
 
-def _proyectar_primer_curso(ag: pd.DataFrame, año_fin_proyeccion: int = 2030) -> pd.DataFrame:
+def _proyectar_primer_curso(
+    ag: pd.DataFrame, año_fin_proyeccion: int | None = None
+) -> pd.DataFrame:
     """
     Proyecta primer_curso por categoría usando el modelo que mejor ajuste a la serie
     histórica completa AÑO_INICIO_PRIMER_CURSO..AÑO_FIN_DATOS.
@@ -2284,6 +2342,20 @@ def _proyectar_primer_curso(ag: pd.DataFrame, año_fin_proyeccion: int = 2030) -
                                   'CONTRACCION'   si pendiente < -20
                                   'SIN_PROYECCION' si no hay suficientes datos
     """
+    # Fix 38: horizonte relativo a AÑO_FIN_DATOS en vez de año calendario fijo.
+    if año_fin_proyeccion is None:
+        año_fin_proyeccion = AÑO_FIN_DATOS + HORIZONTE_PROYECCION_ANOS
+
+    n_años_horizonte = año_fin_proyeccion - AÑO_FIN_DATOS
+    if n_años_horizonte <= 0:
+        msg = (
+            f"año_fin_proyeccion ({año_fin_proyeccion}) debe ser mayor que "
+            f"AÑO_FIN_DATOS ({AÑO_FIN_DATOS}). Verifica HORIZONTE_PROYECCION_ANOS "
+            "en mercado_pipeline.py — no debe quedar en 0 ni en negativo."
+        )
+        log_error(msg)
+        raise ValueError(msg)
+
     pc_cols = {
         y: f"suma_primer_curso_{y}"
         for y in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1)
@@ -2291,7 +2363,6 @@ def _proyectar_primer_curso(ag: pd.DataFrame, año_fin_proyeccion: int = 2030) -
     }
 
     años_proyeccion = list(range(AÑO_FIN_DATOS + 1, año_fin_proyeccion + 1))
-    n_años_horizonte = año_fin_proyeccion - AÑO_FIN_DATOS
 
     for y in años_proyeccion:
         ag[f"PROYECCION_PC_{y}"] = np.nan
@@ -3346,7 +3417,12 @@ _BLOQUES_TOTAL = [
     ]),
 ]
 
-_AÑO_FIN_PROYECCION_FIX26 = 2030
+# Fix 38: horizonte relativo en vez de año calendario fijo. Antes año_fin_proyeccion
+# y esta constante eran dos literales "2030" independientes que solo coincidían por
+# casualidad; a partir de AÑO_FIN_DATOS=2030 el horizonte se hacía 0 (KeyError) y
+# más allá se volvía negativo (signo de PENDIENTE_PROYECCION invertido sin error).
+HORIZONTE_PROYECCION_ANOS = 6
+_AÑO_FIN_PROYECCION_FIX26 = AÑO_FIN_DATOS + HORIZONTE_PROYECCION_ANOS
 _FIX26_POST_PANDEMIA_COLS = ["SEÑAL_TENDENCIA_POST_PANDEMIA", "AAGR_post_pandemia"]
 # Fix 26/33/35/36: proyecciones en total, total_esp, total_mae y total_pregrado.
 _FIX26_PROYECCION_COLS = (
@@ -3363,6 +3439,8 @@ _HOJAS_CON_PROYECCION = frozenset({
 
 def _bloques_hoja_total(sheet_name: str) -> list[tuple[str, list[str]]]:
     """Bloques de columnas para exportación de hojas de análisis de mercado."""
+    # Fix 40: label dinámico — antes quedaba fijo en "2025-2030" sin importar AÑO_FIN_DATOS.
+    _label_proyeccion = f"PROYECCIÓN {AÑO_FIN_DATOS + 1}-{_AÑO_FIN_PROYECCION_FIX26}"
     bloques: list[tuple[str, list[str]]] = []
     for block_name, cols in _BLOQUES_TOTAL:
         if sheet_name in _HOJAS_CON_PROYECCION and block_name == "PARTICIPACIÓN Y CRECIMIENTO":
@@ -3372,7 +3450,7 @@ def _bloques_hoja_total(sheet_name: str) -> list[tuple[str, list[str]]]:
                 if c == "SEÑAL_TENDENCIA":
                     cols_out.extend(_FIX26_POST_PANDEMIA_COLS)
             bloques.append((block_name, cols_out))
-            bloques.append(("PROYECCIÓN 2025-2030", _FIX26_PROYECCION_COLS))
+            bloques.append((_label_proyeccion, _FIX26_PROYECCION_COLS))
         else:
             bloques.append((block_name, cols))
     return bloques
@@ -3978,11 +4056,16 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
     ws.row_dimensions[fila].height = 96
 
     # ── Paso 4: Proyección de demanda ─────────────────────────────────────────
+    # Fix 40: labels dinámicos — antes "2025-2030", "2014-2024" y "2024" quedaban
+    # fijos en el texto aunque el cálculo (Fix 38) ya usara el horizonte relativo.
+    _año_proy_ini = AÑO_FIN_DATOS + 1
+    _año_proy_fin = _AÑO_FIN_PROYECCION_FIX26
+
     fila += 1
     ws.merge_cells(f"A{fila}:N{fila}")
     _cell(
         ws, fila, 1,
-        "Paso 4 — Proyección de demanda (2025-2030)",
+        f"Paso 4 — Proyección de demanda ({_año_proy_ini}-{_año_proy_fin})",
         bold=True, bg="455A64", fg="FFFFFF", size=10, halign="left",
     )
     ws.row_dimensions[fila].height = 18
@@ -3991,9 +4074,11 @@ def _escribir_hoja_estandar(writer: pd.ExcelWriter) -> None:
     ws.merge_cells(f"A{fila}:N{fila}")
     _cell(
         ws, fila, 1,
-        "Proyección 2025-2030 por modelo híbrido (lineal o logarítmico, "
-        "según mejor R² sobre 2014-2024). 'Promedio est./año vs 2024' = "
-        "(proyección 2030 − PC real 2024) / 6. 'Tipo de proyección': "
+        f"Proyección {_año_proy_ini}-{_año_proy_fin} por modelo híbrido (lineal o logarítmico, "
+        f"según mejor R² sobre {AÑO_INICIO_PRIMER_CURSO}-{AÑO_FIN_DATOS}). "
+        f"'Promedio est./año vs {AÑO_FIN_DATOS}' = "
+        f"(proyección {_año_proy_fin} − PC real {AÑO_FIN_DATOS}) / {HORIZONTE_PROYECCION_ANOS}. "
+        "'Tipo de proyección': "
         "↑↑ EXPANSIÓN (>+50/año) · ↑ CRECIENTE (+10 a +50) · → ESTABLE (−10 a +10) · "
         "↓ DECRECIENTE (−20 a −10) · ↓↓ CONTRACCIÓN (<−20). "
         "R² del ajuste indica la fiabilidad estadística del modelo (0-1).",
@@ -5769,6 +5854,8 @@ def run_gap_oportunidades(
         "distancia_costo_pct",
     ]
 
+    # Fix 39: label dinámico en vez de "2019-2024" quemado en el texto.
+    _col_cagr_hdr = f"CAGR {AÑO_INICIO_HISTORICO}-{AÑO_FIN_DATOS} (%)"
     RENAME_COLS = {
         "CATEGORIA_FINAL": "Categoría de mercado",
         "NIVEL_MAYORIT": "Nivel predominante",
@@ -5778,7 +5865,7 @@ def run_gap_oportunidades(
         col_cal: "Calificación (1-5)",
         f"suma_primer_curso_{AÑO_FIN_DATOS}": f"Primer curso {AÑO_FIN_DATOS}",
         "AAGR_ROBUSTO": "AAGR (% anual)",
-        "CAGR_suma": "CAGR 2019-2024 (%)",
+        "CAGR_suma": _col_cagr_hdr,
         "SEÑAL_TENDENCIA": "Señal de tendencia",
         "TIPO_CRECIMIENTO": "Tipo de mercado",
         f"var_yoy_{AÑO_FIN_DATOS}": "Var. último año (%)",
@@ -5860,6 +5947,7 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
     cols = [cell.value for cell in ws[1]]
 
     _col_pc_hdr = f"Primer curso {AÑO_FIN_DATOS}"
+    _col_cagr_hdr = f"CAGR {AÑO_INICIO_HISTORICO}-{AÑO_FIN_DATOS} (%)"
     BLOQUES = {
         "Categoría de mercado": ("IDENTIFICACIÓN", "37474F"),
         "Nivel predominante": ("IDENTIFICACIÓN", "37474F"),
@@ -5869,7 +5957,7 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
         "Calificación (1-5)": ("DECISIÓN", AZUL_OSC),
         _col_pc_hdr: ("MERCADO", "2E7D32"),
         "AAGR (% anual)": ("MERCADO", "2E7D32"),
-        "CAGR 2019-2024 (%)": ("MERCADO", "2E7D32"),
+        _col_cagr_hdr: ("MERCADO", "2E7D32"),
         "Señal de tendencia": ("MERCADO", "2E7D32"),
         "Tipo de mercado": ("MERCADO", "2E7D32"),
         "Var. último año (%)": ("MERCADO", "2E7D32"),
@@ -5978,7 +6066,7 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
                 cell.fill = PatternFill("solid", fgColor=fg)
                 cell.font = Font(bold=True, color=fc, name="Arial", size=10)
 
-            elif col_s in ("AAGR (% anual)", "CAGR 2019-2024 (%)", "Var. último año (%)"):
+            elif col_s in ("AAGR (% anual)", _col_cagr_hdr, "Var. último año (%)"):
                 cell.number_format = "0.0%"
                 cell.font = Font(name="Arial", size=10)
 
@@ -6022,7 +6110,7 @@ def _formatear_hoja_gap(writer: pd.ExcelWriter, df_gap: pd.DataFrame) -> None:
         "Calificación (1-5)": 14,
         _col_pc_hdr: 14,
         "AAGR (% anual)": 13,
-        "CAGR 2019-2024 (%)": 13,
+        _col_cagr_hdr: 13,
         "Señal de tendencia": 20,
         "Tipo de mercado": 16,
         "Var. último año (%)": 14,
@@ -6128,7 +6216,7 @@ def _escribir_hoja_total(
     }
     for _y in range(AÑO_FIN_DATOS + 1, _AÑO_FIN_PROYECCION_FIX26 + 1):
         NOMBRES_LEGIBLES[f"PROYECCION_PC_{_y}"] = f"Proyección PC {_y}"
-    NOMBRES_LEGIBLES["PENDIENTE_PROYECCION"] = "Promedio est./año vs 2024"
+    NOMBRES_LEGIBLES["PENDIENTE_PROYECCION"] = f"Promedio est./año vs {AÑO_FIN_DATOS}"
     NOMBRES_LEGIBLES["R2_PROYECCION"] = "R² del ajuste"
     NOMBRES_LEGIBLES["TIPO_PROYECCION"] = "Tipo de proyección"
     for _y in range(AÑO_INICIO_PRIMER_CURSO, AÑO_FIN_DATOS + 1):
@@ -6167,6 +6255,10 @@ def _escribir_hoja_total(
         NOMBRES_LEGIBLES.setdefault(f"var_suma_{_y}", f"Var. matr. total suma {_y}")
         NOMBRES_LEGIBLES.setdefault(f"var_prom_{_y}", f"Var. matr. total prom {_y}")
 
+    # Fix 40: mismo label dinámico que _bloques_hoja_total, para que la llave coincida
+    # siempre con el nombre de bloque real en vez de depender de que el fallback
+    # "455A64" del .get() más abajo coincida por casualidad con el color deseado.
+    _label_proyeccion = f"PROYECCIÓN {AÑO_FIN_DATOS + 1}-{_AÑO_FIN_PROYECCION_FIX26}"
     COLORES_BLOQUES = {
         "CATEGORÍA": "37474F",
         "DEMANDA NUEVA — PRIMER CURSO": "2E7D32",
@@ -6177,7 +6269,7 @@ def _escribir_hoja_total(
         "COSTO": "6A1B9A",
         "SCORING — valor | puntuación": "000066",
         "CALIFICACIÓN FINAL": "000066",
-        "PROYECCIÓN 2025-2030": "455A64",
+        _label_proyeccion: "455A64",
     }
     wb = writer.book
     # Posición canónica de la hoja: `total` va en índice 1 (justo después de
@@ -6955,10 +7047,13 @@ def exportar_base_maestra_excel(
         (
             "AAGR primer curso (robusto)",
             "Crecimiento anual histórico del mercado",
-            "Average Annual Growth Rate calculado sobre primer_curso 2019-2024. "
+            f"Average Annual Growth Rate calculado sobre primer_curso "
+            f"{AÑO_INICIO_HISTORICO}-{AÑO_FIN_DATOS}. "
             "Formula: promedio de las variaciones interanuales "
-            "(2019-2020, 2020-2021, ..., 2023-2024). "
-            "Para categorias nuevas (sin dato en 2019), se calcula desde el "
+            f"({AÑO_INICIO_HISTORICO}-{AÑO_INICIO_HISTORICO + 1}, "
+            f"{AÑO_INICIO_HISTORICO + 1}-{AÑO_INICIO_HISTORICO + 2}, ..., "
+            f"{AÑO_FIN_DATOS - 1}-{AÑO_FIN_DATOS}). "
+            f"Para categorias nuevas (sin dato en {AÑO_INICIO_HISTORICO}), se calcula desde el "
             "primer año con dato. El pipeline calcula este indicador "
             "correctamente. El AAGR del archivo manual de referencia tenia un "
             "error de formula (AVERAGE/5) que producia valores 5 veces menores "
@@ -6967,7 +7062,7 @@ def exportar_base_maestra_excel(
         (
             "Señal tendencia actual",
             "Momento actual del mercado (ultimo año)",
-            "Basada en la variacion primer_curso 2023-2024 (YoY). "
+            f"Basada en la variacion primer_curso {AÑO_FIN_DATOS - 1}-{AÑO_FIN_DATOS} (YoY). "
             "ACELERANDO: crecimiento mayor a 10% en el ultimo año. "
             "ESTABLE: variacion entre -10% y +10%. "
             "EN DECLIVE: caida en el ultimo año. "
@@ -6980,9 +7075,9 @@ def exportar_base_maestra_excel(
             "Registros con matriculas vs Programas con dato",
             "Dos conteos distintos de programas",
             "Registros con matriculas: filas unicas en SNIES con matricula mayor "
-            "a 0 en 2024. Un mismo programa SNIES puede generar multiples "
+            f"a 0 en {AÑO_FIN_DATOS}. Un mismo programa SNIES puede generar multiples "
             "registros si se ofrece en varias ciudades o modalidades. "
-            "Programas con dato 2024: codigos SNIES unicos con primer_curso "
+            f"Programas con dato {AÑO_FIN_DATOS}: codigos SNIES unicos con primer_curso "
             "mayor a 0. Es normal que Registros sea mayor a Programas unicos.",
         ),
         (
