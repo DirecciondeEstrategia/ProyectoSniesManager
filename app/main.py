@@ -3130,12 +3130,18 @@ class ConfiguracionDialog(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk) -> None:
         super().__init__(parent)
+
+        # Fix ConfigDialog: modalidad antes de construir la UI.
+        self.transient(parent)
+        self.grab_set()
+
         self.title("⚙️ Configuración del Sistema")
         self.resizable(False, False)
         self.configure(bg=EAFIT["bg"])
 
+        w, h = 700, 640
+        self.geometry(f"{w}x{h}")
         self.update_idletasks()
-        w, h = 620, 600
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -3151,9 +3157,22 @@ class ConfiguracionDialog(tk.Toplevel):
         self._smlmv_vars: dict[int, tk.StringVar] = {}
         self._file_labels: dict[str, tuple[ttk.Label, ttk.Label]] = {}
 
+        # Cache en memoria de los años presentes en el consolidado de primer curso.
+        self._años_pc_cache: set[int] | None = None
+        self._debounce_id: str | None = None
+
         self._build_ui()
-        self._año_var.trace_add("write", lambda *_: self.after_idle(self._refresh_archivos))
-        self._refresh_archivos()
+        self._año_var.trace_add("write", lambda *_: self._on_año_changed())
+        self.after(50, self._refresh_archivos_async)
+
+    def _on_año_changed(self) -> None:
+        """Debounce 200ms: un solo refresh tras el último cambio del spinner."""
+        if self._debounce_id is not None:
+            try:
+                self.after_cancel(self._debounce_id)
+            except (ValueError, tk.TclError):
+                pass
+        self._debounce_id = self.after(200, self._refresh_archivos)
 
     @staticmethod
     def _cargar_config() -> dict:
@@ -3183,8 +3202,48 @@ class ConfiguracionDialog(tk.Toplevel):
         return REF_DIR / "backup"
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self, padding=24, style="App.TFrame")
-        main.pack(fill=tk.BOTH, expand=True)
+        # Fix 41: fila de botones fija al fondo de la ventana (fuera del área con
+        # scroll), para que "Cancelar" / "Guardar y aplicar" siempre sean visibles
+        # sin importar cuánto contenido haya arriba ni cuánto se haya desplazado.
+        btn_row = ttk.Frame(self, padding=(24, 10, 24, 16), style="App.TFrame")
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Button(btn_row, text="Cancelar", command=self.destroy, style="Secondary.TButton").pack(
+            side=tk.RIGHT, padx=(8, 0)
+        )
+        ttk.Button(btn_row, text="✅  Guardar y aplicar", command=self._guardar, style="Primary.TButton").pack(
+            side=tk.RIGHT
+        )
+
+        ttk.Separator(self, orient="horizontal").pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Fix 41: área con scroll para el resto del contenido (Canvas + Scrollbar).
+        outer = ttk.Frame(self, style="App.TFrame")
+        outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(outer, bg=EAFIT["bg"], highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main = ttk.Frame(canvas, padding=24, style="App.TFrame")
+        _win_id = canvas.create_window((0, 0), window=main, anchor="nw")
+
+        def _on_main_configure(event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event) -> None:
+            canvas.itemconfig(_win_id, width=event.width)
+
+        main.bind("<Configure>", _on_main_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         ttk.Label(main, text="Configuración del Sistema", style="Header.TLabel").pack(anchor="w", pady=(0, 4))
         ttk.Label(
@@ -3229,22 +3288,26 @@ class ConfiguracionDialog(tk.Toplevel):
 
         grid = ttk.Frame(sec2, style="Card.TFrame")
         grid.pack(fill=tk.X)
+        grid.columnconfigure(1, weight=1)
 
-        for i, (tipo, patron) in enumerate(self._ARCHIVOS_REQUERIDOS.items()):
-            row = i // 2
-            col = (i % 2) * 3
+        _CARPETAS_ARCHIVOS = {
+            "Matrícula": "matriculas",
+            "Inscritos": "inscritos",
+            "Graduados": "graduados",
+        }
 
+        for row, (tipo, patron) in enumerate(self._ARCHIVOS_REQUERIDOS.items()):
             ttk.Label(grid, text=tipo + ":", style="Muted.TLabel", width=15, anchor="w").grid(
-                row=row, column=col, sticky="w", padx=(0, 4), pady=3
+                row=row, column=0, sticky="w", padx=(0, 4), pady=3
             )
 
             lbl_nombre = ttk.Label(grid, text="—", style="Muted.TLabel", font=("Segoe UI", 9), width=28, anchor="w")
-            lbl_nombre.grid(row=row, column=col + 1, sticky="w", pady=3)
+            lbl_nombre.grid(row=row, column=1, sticky="w", pady=3)
 
             lbl_estado = ttk.Label(
                 grid, text="", style="Muted.TLabel", font=("Segoe UI", 10, "bold"), width=4, anchor="center"
             )
-            lbl_estado.grid(row=row, column=col + 2, sticky="w", padx=(0, 16), pady=3)
+            lbl_estado.grid(row=row, column=2, sticky="w", padx=(0, 12), pady=3)
 
             self._file_labels[tipo] = (lbl_nombre, lbl_estado)
 
@@ -3253,7 +3316,13 @@ class ConfiguracionDialog(tk.Toplevel):
                     grid,
                     text="📥 Agregar año nuevo al consolidado",
                     command=self._on_actualizar_primer_curso,
-                ).grid(row=row, column=col + 3, sticky="w", padx=(4, 0), pady=3)
+                ).grid(row=row, column=3, sticky="w", padx=(4, 0), pady=3)
+            elif tipo in _CARPETAS_ARCHIVOS:
+                ttk.Button(
+                    grid,
+                    text="📁 Agregar archivo",
+                    command=lambda t=tipo: self._on_agregar_archivo_referencia(t),
+                ).grid(row=row, column=3, sticky="w", padx=(4, 0), pady=3)
 
         self._lbl_resumen = ttk.Label(sec2, text="", style="Muted.TLabel", font=("Segoe UI", 9, "italic"))
         self._lbl_resumen.pack(anchor="w", pady=(8, 0))
@@ -3265,8 +3334,8 @@ class ConfiguracionDialog(tk.Toplevel):
             anchor="w", pady=(0, 10)
         )
 
-        smlmv_grid = ttk.Frame(sec3, style="Card.TFrame")
-        smlmv_grid.pack(fill=tk.X)
+        self._smlmv_grid = ttk.Frame(sec3, style="Card.TFrame")
+        self._smlmv_grid.pack(fill=tk.X)
 
         try:
             from etl.config import SMLMV_POR_ANO
@@ -3283,19 +3352,18 @@ class ConfiguracionDialog(tk.Toplevel):
                 except (TypeError, ValueError):
                     pass
 
-        años_smlmv = sorted(smlmv_base.keys())
-        for i, año in enumerate(años_smlmv):
-            row = i // 3
-            col = (i % 3) * 3
-            var = tk.StringVar(value=f"{smlmv_base[año]:,}".replace(",", "."))
-            self._smlmv_vars[año] = var
+        for año, valor in smlmv_base.items():
+            self._smlmv_vars[año] = tk.StringVar(value=f"{valor:,}".replace(",", "."))
 
-            ttk.Label(smlmv_grid, text=f"{año}:", style="Muted.TLabel", width=6, anchor="e").grid(
-                row=row, column=col, padx=(8, 2), pady=2, sticky="e"
-            )
-            ttk.Entry(smlmv_grid, textvariable=var, width=12, font=("Segoe UI", 9)).grid(
-                row=row, column=col + 1, padx=(0, 8), pady=2, sticky="w"
-            )
+        self._render_smlmv_grid()
+
+        agregar_row = ttk.Frame(sec3, style="Card.TFrame")
+        agregar_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(
+            agregar_row,
+            text="➕ Agregar año nuevo",
+            command=self._on_agregar_año_smlmv,
+        ).pack(side=tk.LEFT)
 
         ttk.Label(
             sec3,
@@ -3303,16 +3371,68 @@ class ConfiguracionDialog(tk.Toplevel):
             style="Light.TLabel",
         ).pack(anchor="w", pady=(6, 0))
 
-        btn_row = ttk.Frame(main, style="App.TFrame")
-        btn_row.pack(fill=tk.X, pady=(6, 0))
+    def _render_smlmv_grid(self) -> None:
+        """(Re)dibuja la cuadrícula de SMLMV a partir de self._smlmv_vars, ordenada por año."""
+        for widget in self._smlmv_grid.winfo_children():
+            widget.destroy()
 
-        ttk.Button(btn_row, text="Cancelar", command=self.destroy, style="Secondary.TButton").pack(
-            side=tk.RIGHT, padx=(8, 0)
-        )
+        años_smlmv = sorted(self._smlmv_vars.keys())
+        for i, año in enumerate(años_smlmv):
+            row = i // 3
+            col = (i % 3) * 3
+            ttk.Label(self._smlmv_grid, text=f"{año}:", style="Muted.TLabel", width=6, anchor="e").grid(
+                row=row, column=col, padx=(8, 2), pady=2, sticky="e"
+            )
+            ttk.Entry(
+                self._smlmv_grid, textvariable=self._smlmv_vars[año], width=12, font=("Segoe UI", 9)
+            ).grid(row=row, column=col + 1, padx=(0, 8), pady=2, sticky="w")
 
-        ttk.Button(btn_row, text="✅  Guardar y aplicar", command=self._guardar, style="Primary.TButton").pack(
-            side=tk.RIGHT
+    def _on_agregar_año_smlmv(self) -> None:
+        """Agrega un año nuevo al editor de SMLMV sin editar config.json a mano."""
+        años_existentes = sorted(self._smlmv_vars.keys())
+        try:
+            sugerido = (años_existentes[-1] + 1) if años_existentes else int(self._año_var.get())
+        except (ValueError, tk.TclError):
+            sugerido = años_existentes[-1] + 1 if años_existentes else 2026
+
+        año = simpledialog.askinteger(
+            "Agregar año de SMLMV",
+            "¿Qué año calendario deseas agregar?",
+            parent=self,
+            minvalue=2019,
+            maxvalue=2050,
+            initialvalue=sugerido,
         )
+        if año is None:
+            return
+        if año in self._smlmv_vars:
+            messagebox.showwarning(
+                "Año ya existe",
+                f"El año {año} ya está en la lista. Edita su valor directamente en el campo.",
+                parent=self,
+            )
+            return
+
+        valor_sugerido = self._smlmv_vars[años_existentes[-1]].get() if años_existentes else ""
+
+        valor_str = simpledialog.askstring(
+            f"SMLMV {año}",
+            f"Valor del SMLMV para {año} (ej. 1500000):",
+            parent=self,
+            initialvalue=valor_sugerido,
+        )
+        if valor_str is None:
+            return
+        try:
+            valor = int(str(valor_str).strip().replace(".", "").replace(",", ""))
+            if valor <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", f"Valor inválido: '{valor_str}'.", parent=self)
+            return
+
+        self._smlmv_vars[año] = tk.StringVar(value=f"{valor:,}".replace(",", "."))
+        self._render_smlmv_grid()
 
     def _refresh_archivos(self) -> None:
         try:
@@ -3326,15 +3446,12 @@ class ConfiguracionDialog(tk.Toplevel):
 
         for tipo, patron in self._ARCHIVOS_REQUERIDOS.items():
             if tipo == "Primer curso":
-                from etl.mercado_pipeline import (
-                    consolidado_primer_curso_contiene_año,
-                    ruta_consolidado_primer_curso,
-                )
-
-                ruta_pc = ruta_consolidado_primer_curso()
-                existe = ruta_pc.exists() and consolidado_primer_curso_contiene_año(año, ruta_pc)
                 lbl_nombre, lbl_estado = self._file_labels[tipo]
                 lbl_nombre.configure(text=patron)
+                if self._años_pc_cache is None:
+                    lbl_estado.configure(text="⏳", foreground=EAFIT.get("warning", "#FFA500"))
+                    continue
+                existe = año in self._años_pc_cache
                 lbl_estado.configure(
                     text="✅" if existe else "❌",
                     foreground=EAFIT["success"] if existe else EAFIT["danger"],
@@ -3376,6 +3493,60 @@ class ConfiguracionDialog(tk.Toplevel):
             color = EAFIT["warning"]
 
         self._lbl_resumen.configure(text=resumen, foreground=color)
+
+    def _refresh_archivos_async(self) -> None:
+        """
+        Versión asíncrona de _refresh_archivos para la apertura inicial.
+        Lee el consolidado de primer_curso UNA sola vez en un hilo de fondo y
+        cachea el conjunto completo de años disponibles en self._años_pc_cache.
+        """
+        try:
+            año = int(self._año_var.get())
+        except (ValueError, tk.TclError):
+            return
+
+        backup = self._get_ref_backup()
+
+        for tipo, patron in self._ARCHIVOS_REQUERIDOS.items():
+            if tipo == "Primer curso":
+                lbl_nombre, lbl_estado = self._file_labels[tipo]
+                lbl_nombre.configure(text=patron)
+                lbl_estado.configure(text="⏳", foreground=EAFIT.get("warning", "#FFA500"))
+                continue
+
+            nombre = patron.format(año=año)
+            candidatos = [
+                backup / nombre,
+                backup / "matriculas" / nombre,
+                backup / "matriculas primer curso" / nombre,
+                backup / "inscritos" / nombre,
+                backup / "graduados" / nombre,
+            ]
+            existe = any(c.exists() for c in candidatos)
+            lbl_nombre, lbl_estado = self._file_labels[tipo]
+            lbl_nombre.configure(text=nombre)
+            lbl_estado.configure(
+                text="✅" if existe else "❌",
+                foreground=EAFIT["success"] if existe else EAFIT["danger"],
+            )
+
+        def _cargar_cache_años() -> None:
+            try:
+                from etl.mercado_pipeline import obtener_años_disponibles_consolidado_primer_curso
+
+                años = obtener_años_disponibles_consolidado_primer_curso()
+            except Exception:
+                años = set()
+
+            def _update() -> None:
+                if not self.winfo_exists():
+                    return
+                self._años_pc_cache = años
+                self._refresh_archivos()
+
+            self.after(0, _update)
+
+        threading.Thread(target=_cargar_cache_años, daemon=True).start()
 
     def _on_actualizar_primer_curso(self) -> None:
         try:
@@ -3434,9 +3605,89 @@ class ConfiguracionDialog(tk.Toplevel):
             f"{extra_cols}",
             parent=self,
         )
+        if self._años_pc_cache is not None:
+            self._años_pc_cache.add(int(resumen["año"]))
+        self._refresh_archivos()
+
+    def _on_agregar_archivo_referencia(self, tipo: str) -> None:
+        """
+        Copia un archivo de referencia (Matrícula, Inscritos o Graduados) a su
+        carpeta correspondiente en ref/backup/, con el nombre estandarizado que
+        espera el pipeline (ej. matriculados_2025.xlsx).
+        """
+        carpetas = {
+            "Matrícula": "matriculas",
+            "Inscritos": "inscritos",
+            "Graduados": "graduados",
+        }
+        carpeta_rel = carpetas.get(tipo)
+        if carpeta_rel is None:
+            return
+
+        patron = self._ARCHIVOS_REQUERIDOS[tipo]
+
+        try:
+            año_sugerido = int(self._año_var.get())
+        except (ValueError, tk.TclError):
+            año_sugerido = 2024
+
+        año = simpledialog.askinteger(
+            f"Agregar archivo de {tipo}",
+            f"¿Para qué año es este archivo de {tipo}?",
+            parent=self,
+            minvalue=2019,
+            maxvalue=2050,
+            initialvalue=año_sugerido,
+        )
+        if año is None:
+            return
+
+        ruta_origen = filedialog.askopenfilename(
+            parent=self,
+            title=f"Seleccionar archivo de {tipo} ({año})",
+            filetypes=[("Excel", "*.xlsx"), ("Todos", "*.*")],
+        )
+        if not ruta_origen:
+            return
+
+        nombre_destino = patron.format(año=año)
+        carpeta_destino = self._get_ref_backup() / carpeta_rel
+        carpeta_destino.mkdir(parents=True, exist_ok=True)
+        ruta_destino = carpeta_destino / nombre_destino
+
+        if ruta_destino.exists():
+            sobrescribir = messagebox.askyesno(
+                "El archivo ya existe",
+                f"Ya existe {nombre_destino} en ref/backup/{carpeta_rel}/.\n\n"
+                "¿Deseas reemplazarlo con el archivo seleccionado?",
+                parent=self,
+            )
+            if not sobrescribir:
+                return
+
+        try:
+            shutil.copy2(ruta_origen, ruta_destino)
+        except Exception as exc:
+            messagebox.showerror(
+                "Error al copiar archivo",
+                f"No se pudo copiar el archivo a ref/backup/{carpeta_rel}/{nombre_destino}:\n\n{exc}",
+                parent=self,
+            )
+            return
+
+        messagebox.showinfo(
+            "Archivo agregado",
+            f"{nombre_destino} copiado correctamente a ref/backup/{carpeta_rel}/.",
+            parent=self,
+        )
         self._refresh_archivos()
 
     def _guardar(self) -> None:
+        try:
+            from etl.config import AÑO_FIN_DATOS as _año_previo
+        except Exception:
+            _año_previo = None
+
         try:
             año_nuevo = int(self._año_var.get())
             if año_nuevo < 2019 or año_nuevo > 2035:
@@ -3469,13 +3720,23 @@ class ConfiguracionDialog(tk.Toplevel):
                 reload_year_and_smlmv_from_config_file()
             except Exception:
                 pass
-            messagebox.showinfo(
-                "Configuración guardada",
-                f"AÑO_FIN_DATOS = {año_nuevo}\n\n"
-                "Los valores de año y SMLMV quedaron activos en esta sesión. "
-                "Si algo no se refleja, reinicia la aplicación.",
-                parent=self,
-            )
+            año_cambio = año_nuevo != _año_previo
+            if año_cambio:
+                messagebox.showwarning(
+                    "Reinicio requerido",
+                    f"AÑO_FIN_DATOS = {año_nuevo}\n\n"
+                    "El año cambió. Este cambio queda guardado en config.json, pero NO se aplicará "
+                    "a los cálculos del pipeline hasta que cierres y vuelvas a abrir SniesManager.\n\n"
+                    "Si ejecutas el pipeline ahora sin reiniciar, el sistema lo detectará y "
+                    "detendrá la ejecución con un aviso, en vez de calcular con el año anterior.",
+                    parent=self,
+                )
+            else:
+                messagebox.showinfo(
+                    "Configuración guardada",
+                    f"AÑO_FIN_DATOS = {año_nuevo}\n\nSMLMV actualizado para esta sesión.",
+                    parent=self,
+                )
             self.destroy()
         except Exception as e:
             messagebox.showerror("Error al guardar", str(e), parent=self)
@@ -5088,8 +5349,6 @@ class MainMenuGUI:
     def _open_configuracion(self) -> None:
         """Abre el diálogo de configuración del sistema."""
         dlg = ConfiguracionDialog(self.root)
-        dlg.transient(self.root)
-        dlg.grab_set()
         self.root.wait_window(dlg)
 
     def _open_gestion_programas(self) -> None:

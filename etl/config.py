@@ -426,6 +426,26 @@ def get_smlmv_sesion() -> float:
         pass
     return float(obtener_smlmv_vigente())
 
+
+def get_año_fin_datos_en_disco() -> int:
+    """
+    Lee AÑO_FIN_DATOS directamente desde config.json en disco, sin depender de
+    ningún valor ya importado en otros módulos.
+
+    Se usa para detectar si el proceso actual quedó desincronizado: si alguien
+    cambió el año desde 'Configuración del Sistema' pero no reinició la
+    aplicación, el AÑO_FIN_DATOS que mercado_pipeline.py/scoring.py tienen
+    cargado en memoria (importado una sola vez al arrancar) puede diferir del
+    que hay ahora en config.json. Ver validar_archivos_entrada() en
+    mercado_pipeline.py, que usa esta función para bloquear el pipeline en
+    vez de correr silenciosamente con el año equivocado.
+    """
+    c = _load_config()
+    if isinstance(c.get("AÑO_FIN_DATOS"), int) and c["AÑO_FIN_DATOS"] > 2019:
+        return int(c["AÑO_FIN_DATOS"])
+    return AÑO_FIN_DATOS
+
+
 # Fase 5: exportación estudio de mercado
 ARCHIVO_ESTUDIO_MERCADO = ESTUDIO_MERCADO_DIR / "Estudio_Mercado_Colombia.xlsx"
 

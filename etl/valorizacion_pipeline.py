@@ -971,8 +971,8 @@ def _construir_tabla_crecimiento(sabana: pd.DataFrame) -> pd.DataFrame:
     yr_ini = AÑO_INICIO_PRIMER_CURSO
     yr_fin = AÑO_FIN_DATOS
     col_cagr_full = f"CAGR {yr_ini}-{yr_fin}"
-    col_cagr_2019 = "CAGR 2019-2024"
-    col_cagr_2021 = "CAGR 2021-2024"
+    col_cagr_2019 = f"CAGR 2019-{yr_fin}"
+    col_cagr_2021 = f"CAGR 2021-{yr_fin}"
 
     def _norm_sector(v: object) -> str:
         u = str(v).upper().strip()
@@ -2365,8 +2365,8 @@ def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
     yr_est = list(range(AÑO_INICIO_HISTORICO, yr_fin + 1))
     años_cols = [str(y) for y in yr_pre + yr_est]
     col_cagr_full = f"CAGR {yr_ini}-{yr_fin}"
-    col_cagr_2019 = "CAGR 2019-2024"
-    col_cagr_2021 = "CAGR 2021-2024"
+    col_cagr_2019 = f"CAGR 2019-{yr_fin}"
+    col_cagr_2021 = f"CAGR 2021-{yr_fin}"
     cols_cagr = [col_cagr_full, col_cagr_2019, col_cagr_2021]
     all_cols = ["NIVEL"] + años_cols + cols_cagr
     last_col = len(all_cols)
@@ -2386,8 +2386,8 @@ def _formatear_hoja_crecimiento(writer, df: pd.DataFrame) -> None:
     header_labels = {
         "NIVEL": "NIVEL",
         col_cagr_full: f"CAGR {yr_ini}-{yr_fin_short}",
-        col_cagr_2019: "CAGR 2019-24",
-        col_cagr_2021: "CAGR 2021-24",
+        col_cagr_2019: f"CAGR 2019-{yr_fin_short}",
+        col_cagr_2021: f"CAGR 2021-{yr_fin_short}",
     }
 
     # Fila 1: encabezados de columna
