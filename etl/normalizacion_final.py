@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # Configurar sys.path para permitir ejecución directa del script
@@ -25,7 +26,6 @@ from etl.config import (
     ARCHIVO_PROGRAMAS,
     HOJA_PROGRAMAS,
 )
-from etl.normalizacion import COLUMNAS_A_NORMALIZAR
 HOJA_ESPECIAL_INSTITUCION = "NOMBRE_INSTITUCIÓN"
 COLUMNA_ID_INSTITUCION = "CÓDIGO_INSTITUCIÓN_PADRE"
 
@@ -160,21 +160,22 @@ def aplicar_normalizacion_final(df: pd.DataFrame | None = None, archivo: Path | 
             log_info(f"  -> Usando columna '{COLUMNA_ID_INSTITUCION}' para mapeo por ID")
             
         else:
-            # Para las demás columnas, mapear el texto directamente
-            # Guardar referencia a columna original (para conteo y restauración)
+            # Para las demás columnas, mapear el texto directamente.
+            # IMPORTANTE: aplicar el mapeo SOLO sobre valores no nulos para evitar
+            # que NaN se convierta en la cadena "nan" y cause cruces fantasma.
             columna_original = df[nombre_columna]
-            # Crear máscara de NaN antes de conversión para preservarlos
             mask_nan_original = columna_original.isna()
-            
-            # Convertir a string, limpiar espacios y aplicar mapeo (vectorizado)
-            valores_mapeados = columna_original.astype(str).str.strip().map(mapeo)
-            
-            # Restaurar valores originales donde no hay mapeo (eficiente)
-            df[nombre_columna] = valores_mapeados.fillna(columna_original)
-            
-            # Restaurar NaN originales solo donde era necesario (optimizado)
+
+            serie_no_nula = columna_original[~mask_nan_original].astype(str).str.strip()
+            valores_mapeados = serie_no_nula.map(mapeo)
+
+            df[nombre_columna] = columna_original.copy()
+            mask_mapeado = valores_mapeados.notna()
+            if mask_mapeado.any():
+                df.loc[valores_mapeados[mask_mapeado].index, nombre_columna] = valores_mapeados[mask_mapeado]
+
             if mask_nan_original.any():
-                df.loc[mask_nan_original, nombre_columna] = pd.NA
+                df.loc[mask_nan_original, nombre_columna] = np.nan
         
         # Contar reemplazos de forma optimizada (común para ambos casos)
         # Comparar solo donde ambos tienen valores (evita comparaciones innecesarias)
@@ -198,42 +199,6 @@ def aplicar_normalizacion_final(df: pd.DataFrame | None = None, archivo: Path | 
     
     log_info(f"Total de columnas procesadas: {columnas_procesadas}")
     log_info(f"Total de valores reemplazados: {total_reemplazos}")
-    
-    # IMPORTANTE: Después de aplicar mapeos, normalizar a minúsculas las columnas
-    # que están en COLUMNAS_A_NORMALIZAR para mantener consistencia
-    # (los mapeos pueden venir en mayúsculas desde el archivo Excel)
-    log_info("Aplicando normalización de mayúsculas/minúsculas a columnas normalizadas...")
-    from unidecode import unidecode
-    import re
-    
-    columnas_normalizadas_caso = 0
-    for columna in COLUMNAS_A_NORMALIZAR:
-        if columna in df.columns:
-            try:
-                # Normalizar a minúsculas: unidecode + lower + limpiar caracteres especiales
-                s = df[columna].fillna("").astype(str)
-                # Aplicar unidecode y convertir a minúsculas
-                if len(s) > 100:
-                    # Procesar en chunks para mejor rendimiento
-                    chunks = [s.iloc[i:i+100] for i in range(0, len(s), 100)]
-                    s_normalized = pd.concat([
-                        pd.Series([unidecode(str(x)).lower() if x else "" for x in chunk], index=chunk.index)
-                        for chunk in chunks
-                    ])
-                    s = s_normalized
-                else:
-                    s = s.map(lambda x: unidecode(x).lower() if x else "")
-                # Limpiar caracteres especiales y espacios múltiples
-                s = s.str.replace(r"[^a-z0-9\s]", " ", regex=True)
-                s = s.str.replace(r"\s+", " ", regex=True).str.strip()
-                df[columna] = s
-                columnas_normalizadas_caso += 1
-            except Exception as e:
-                log_info(f"Advertencia: Error al normalizar caso de '{columna}': {e}. Continuando...")
-                continue
-    
-    if columnas_normalizadas_caso > 0:
-        log_info(f"✓ Normalización de caso aplicada a {columnas_normalizadas_caso} columnas")
     
     # Si se proporcionó df pero no archivo, solo retornar (sin escribir)
     # Esto permite que el pipeline escriba el archivo una sola vez al final

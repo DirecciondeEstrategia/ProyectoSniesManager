@@ -57,14 +57,22 @@ def _mover_archivo_existente(archivo_programas: str) -> None:
 
     Este método NO debe llamarse antes de confirmar que existe una "nueva" versión
     lista para reemplazarla. Así evitamos modificar archivos si fallan todas las fuentes.
+    
+    Raises:
+        PermissionError: Si el archivo está abierto en otro programa (Excel, etc.)
+        OSError: Si hay otro error al mover el archivo
     """
     historic_dir_str = str(HISTORIC_DIR)
+    
+    # Asegurar que el directorio histórico existe
+    Path(historic_dir_str).mkdir(parents=True, exist_ok=True)
 
     if not os.path.exists(archivo_programas):
         print(f"No existe archivo {os.path.basename(archivo_programas)} en el directorio. Continuando...")
         return
     
     print(f"Archivo {os.path.basename(archivo_programas)} encontrado. Moviendo a histórico...")
+    log_info(f"Movimiento a histórico iniciado: {os.path.basename(archivo_programas)}")
     
     # Obtener la fecha de modificación del archivo (fecha de descarga original)
     fecha_modificacion = os.path.getmtime(archivo_programas)
@@ -81,10 +89,22 @@ def _mover_archivo_existente(archivo_programas: str) -> None:
         counter += 1
     
     try:
+        # Intentar mover el archivo
         os.replace(archivo_programas, destination)
         nombre_archivo_historico = os.path.basename(destination)
-        print(f"  -> Archivo movido a histórico: {nombre_archivo_historico}")
-        log_info(f"Archivo movido a histórico: {nombre_archivo_historico}")
+        print(f"  ✓ Archivo movido exitosamente a histórico: {nombre_archivo_historico}")
+        print(f"  → Ubicación: {destination}")
+        log_info(f"Archivo movido a histórico: {nombre_archivo_historico} → {destination}")
+    except PermissionError as e:
+        # Re-lanzar PermissionError para que el llamador pueda manejarlo (intentar copiar)
+        error_msg = (
+            f"No se pudo mover archivo al histórico ({os.path.basename(archivo_programas)}): "
+            f"El archivo está abierto en otro programa (Excel, etc.). "
+            f"Por favor, ciérralo e intenta de nuevo. Detalle: {e}"
+        )
+        print(f"[ERROR] {error_msg}")
+        log_error(error_msg)
+        raise PermissionError(error_msg) from e
     except OSError as e:
         error_msg = f"No se pudo mover archivo al histórico ({os.path.basename(archivo_programas)}): {e}"
         print(f"[ERROR] {error_msg}")
@@ -104,12 +124,6 @@ def _commit_programas(staged_file: Path, fuente: str) -> str | None:
     try:
         if not staged_file.exists():
             raise FileNotFoundError(f"Staged file no existe: {staged_file}")
-
-        # Marcar fuente en el staged (no en outputs todavía)
-        try:
-            _escribir_fuente_datos_excel(staged_file, fuente)
-        except Exception:
-            pass
 
         dest = Path(DOWNLOAD_DIR) / f"{RENAME_TO}.xlsx"
         dest_str = str(dest)
@@ -218,24 +232,14 @@ def _wait_for_download(dirpath: str, before_set: set[str], timeout_sec: int, can
     raise TimeoutError("No se detectó un archivo descargado listo a tiempo.")
 
 
-def _escribir_fuente_datos_excel(path_xlsx: Path, fuente: str) -> None:
-    try:
-        df = pd.read_excel(path_xlsx, sheet_name=HOJA_PROGRAMAS)
-    except Exception:
-        return
-    df["FUENTE_DATOS"] = fuente
-    with pd.ExcelWriter(path_xlsx, mode="a", if_sheet_exists="replace", engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=HOJA_PROGRAMAS, index=False)
-
-
 def main(log_callback=None, cancel_event=None) -> str | None:
     """
     Proceso principal:
     Estrategia "sin cambios si todo falla":
     - Primero intenta obtener una nueva versión en un directorio temporal (staging).
-    - Solo si alguna fuente produce un archivo listo, reemplaza outputs/Programas.xlsx
+    - Solo si la descarga SNIES produce un archivo listo, reemplaza outputs/Programas.xlsx
       y envía el anterior a histórico.
-    - Si fallan SNIES + API + histórico local, NO modifica ningún archivo.
+    - Si falla la descarga SNIES, NO modifica ningún archivo.
     
     Args:
         log_callback: Función opcional para recibir mensajes de log (para mostrar en GUI).
@@ -548,12 +552,9 @@ def main(log_callback=None, cancel_event=None) -> str | None:
             time.sleep(retry_delay_sec)
 
     if selenium_error:
-        # Opción A: NO usar API ni histórico como reemplazo automático.
         # Si SNIES falla, abortamos sin modificar outputs/Programas.xlsx.
         log_error(
-            "Fallo en descarga WEB_SNIES. Por política, no se usará fallback a API ni a histórico "
-            "para evitar trabajar con información potencialmente desactualizada. "
-            "No se realizaron modificaciones sobre los archivos existentes. "
+            "Fallo en descarga WEB_SNIES. No se realizaron modificaciones sobre los archivos existentes. "
             f"Detalle: {selenium_error}"
         )
     return None
